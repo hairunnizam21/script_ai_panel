@@ -86,6 +86,9 @@ if [ ! -f .env ] || [ "${SUZU_FORCE_REINIT_ENV:-0}" = "1" ]; then
   read -rp "Firebase project ID (suzu-ai-39dc5): " FIREBASE_PROJECT_ID
   FIREBASE_PROJECT_ID="${FIREBASE_PROJECT_ID:-suzu-ai-39dc5}"
 
+  # Generate a random admin token for the REST admin API + APK panel.
+  SUZU_ADMIN_TOKEN="$(openssl rand -hex 24 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48)"
+
   cat > .env <<EOF
 NODE_ENV=production
 PORT=3001
@@ -94,12 +97,21 @@ AI_API_BASE_URL=$AI_API_BASE_URL
 AI_DEFAULT_MODEL=$AI_DEFAULT_MODEL
 FIREBASE_PROJECT_ID=$FIREBASE_PROJECT_ID
 SUZU_DOMAIN=$DOMAIN
+SUZU_ADMIN_TOKEN=$SUZU_ADMIN_TOKEN
 EOF
   chmod 600 .env
   c_grn "  Wrote .env"
+  c_cyn "  Generated admin token (for the APK admin panel):"
+  printf "    %s\n" "$SUZU_ADMIN_TOKEN"
 else
   c_yel "Existing .env preserved — use 'suzu-admin' to edit."
   DOMAIN="$(grep -E '^SUZU_DOMAIN=' .env | sed 's/SUZU_DOMAIN=//')"
+  # Backfill admin token if missing on existing installs
+  if ! grep -qE '^SUZU_ADMIN_TOKEN=' .env; then
+    SUZU_ADMIN_TOKEN="$(openssl rand -hex 24 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48)"
+    printf "SUZU_ADMIN_TOKEN=%s\n" "$SUZU_ADMIN_TOKEN" >> .env
+    c_cyn "  Backfilled SUZU_ADMIN_TOKEN: $SUZU_ADMIN_TOKEN"
+  fi
 fi
 
 c_bld "==> Installing npm dependencies"

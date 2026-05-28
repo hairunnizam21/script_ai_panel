@@ -379,14 +379,113 @@ action_update_repo() {
 }
 
 action_view_env() {
-  c_bld "=== Current .env (API key masked) ==="
+  c_bld "=== Current .env (secrets masked) ==="
   awk -F= '{
-    if ($1=="AI_API_KEY") {
+    if ($1=="AI_API_KEY" || $1=="SUZU_ADMIN_TOKEN") {
       v=$2
       if (length(v)>8) { print $1"="substr(v,1,4)"…"substr(v,length(v)-3) }
       else { print $1"=…" }
     } else { print $0 }
   }' "$ENV_FILE"
+  press_enter
+}
+
+action_backup() {
+  c_bld "=== Export backup (zip of suzu.db + meta.json) ==="
+  local ts="$(date +%Y%m%d-%H%M%S)"
+  local out="/var/backups/suzu-backup-$ts.zip"
+  mkdir -p /var/backups
+  if ! command -v zip >/dev/null 2>&1; then
+    c_yel "Installing 'zip'…"
+    apt-get install -y zip >/dev/null 2>&1 || { c_red "Failed to install zip."; press_enter; return; }
+  fi
+  local work; work="$(mktemp -d)"
+  # Online snapshot via sqlite3 .backup to avoid WAL inconsistency.
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    apt-get install -y sqlite3 >/dev/null 2>&1 || true
+  fi
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$DB_FILE" ".backup '$work/suzu.db'" || { c_red "sqlite3 .backup failed"; rm -rf "$work"; press_enter; return; }
+  else
+    cp "$DB_FILE" "$work/suzu.db" || { c_red "cp failed"; rm -rf "$work"; press_enter; return; }
+  fi
+  local users convs
+  users="$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM users" 2>/dev/null || echo 0)"
+  convs="$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM conversations" 2>/dev/null || echo 0)"
+  cat > "$work/meta.json" <<EOF
+{
+  "version": 1,
+  "app": "suzu-ai-web",
+  "exported_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "user_count": $users,
+  "conversation_count": $convs
+}
+EOF
+  ( cd "$work" && zip -q -9 "$out" suzu.db meta.json )
+  rm -rf "$work"
+  c_grn "Saved: $out"
+  printf "  users:         %s\n" "$users"
+  printf "  conversations: %s\n" "$convs"
+  press_enter
+}
+
+action_restore() {
+  c_bld "=== Import backup (zip from /api/admin/backup) ==="
+  read -rp "Path to backup .zip: " zp
+  zp="${zp/#\~/$HOME}"
+  if [ ! -f "$zp" ]; then c_red "Not found: $zp"; press_enter; return; fi
+  if ! command -v unzip >/dev/null 2>&1; then
+    apt-get install -y unzip >/dev/null 2>&1 || { c_red "Failed to install unzip."; press_enter; return; }
+  fi
+  local work; work="$(mktemp -d)"
+  unzip -q "$zp" -d "$work" || { c_red "Invalid zip."; rm -rf "$work"; press_enter; return; }
+  if [ ! -f "$work/suzu.db" ]; then c_red "ZIP missing suzu.db"; rm -rf "$work"; press_enter; return; fi
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$work/suzu.db" "SELECT COUNT(*) FROM users" >/dev/null 2>&1 \
+      || { c_red "Not a valid Suzu DB (no users table)."; rm -rf "$work"; press_enter; return; }
+  fi
+  echo
+  c_yel "WARNING: this will REPLACE the current database."
+  read -rp "Type 'restore' to confirm: " ok
+  [ "$ok" = "restore" ] || { c_yel "Cancelled."; rm -rf "$work"; press_enter; return; }
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  local safety="$DB_FILE.bak-$ts"
+  cp "$DB_FILE" "$safety" 2>/dev/null && c_yel "Safety snapshot: $safety"
+  # Stop service while we swap.
+  pm2 stop suzu-ai >/dev/null 2>&1 || true
+  rm -f "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm" "$DB_FILE-journal"
+  cp "$work/suzu.db" "$DB_FILE"
+  pm2 start suzu-ai >/dev/null 2>&1 || pm2 restart suzu-ai >/dev/null
+  rm -rf "$work"
+  c_grn "Restore selesai."
+  press_enter
+}
+
+action_admin_token() {
+  c_bld "=== Admin token (for APK admin panel) ==="
+  local cur
+  cur="$(env_get SUZU_ADMIN_TOKEN)"
+  if [ -z "$cur" ]; then
+    c_yel "No token yet. Generating one…"
+  else
+    printf "Current: %s\n" "$cur"
+  fi
+  echo
+  echo "  1) Show full token"
+  echo "  2) Generate a new token (existing APK installs must re-pair)"
+  echo "  0) Back"
+  read -rp "Choice: " a
+  case "$a" in
+    1) printf "Token: %s\n" "$cur" ;;
+    2)
+       local newt
+       newt="$(openssl rand -hex 24 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48)"
+       env_set SUZU_ADMIN_TOKEN "$newt"
+       restart_service
+       c_grn "New admin token: $newt"
+       ;;
+    *) return ;;
+  esac
   press_enter
 }
 
@@ -417,6 +516,10 @@ show_menu() {
   echo " 13) View live logs"
   echo " 14) git pull + rebuild + restart"
   echo " 15) View current .env"
+  echo " 16) Admin token (show / regenerate)"
+  c_yel " ─── Backup ───"
+  echo " 17) Export backup (zip)"
+  echo " 18) Import backup (zip)"
   echo "  0) Exit to shell"
   echo
   read -rp "Choose an option: " choice
@@ -443,6 +546,9 @@ main() {
       13) action_logs ;;
       14) action_update_repo ;;
       15) action_view_env ;;
+      16) action_admin_token ;;
+      17) action_backup ;;
+      18) action_restore ;;
       0|q|Q|exit) c_grn "Bye."; exit 0 ;;
       *) c_red "Invalid choice."; sleep 1 ;;
     esac
