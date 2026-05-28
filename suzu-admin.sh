@@ -154,18 +154,202 @@ action_set_user_limit() {
   press_enter
 }
 
+osc52_copy() {
+  # Best-effort clipboard copy via OSC52 escape (works in iTerm2, Windows Terminal,
+  # kitty, mintty, recent xterm, tmux with set-clipboard on, etc).
+  local data="$1" b64
+  if command -v base64 >/dev/null 2>&1; then
+    b64="$(printf '%s' "$data" | base64 | tr -d '\n')"
+    printf '\033]52;c;%s\a' "$b64" >/dev/tty 2>/dev/null || true
+  fi
+}
+
+_grant_uid() {
+  local UID2="$1"
+  [ -z "$UID2" ] && return
+  printf "Duration formats: 24h, 7d, 30d, 3mo, 1y, or a bare number = days\n"
+  read -rp "Premium duration [30d]: " DUR
+  DUR="${DUR:-30d}"
+  local secs
+  if ! secs="$(parse_duration_to_seconds "$DUR")"; then c_red "Invalid duration."; return; fi
+  read -rp "Premium daily token limit [20000000]: " LIM
+  LIM="${LIM:-20000000}"
+  if ! [[ "$LIM" =~ ^[0-9]+$ ]]; then c_red "Limit must be integer."; return; fi
+  local expiry_iso
+  expiry_iso="$(date -u -d "+$secs seconds" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || python3 -c "import datetime; print((datetime.datetime.utcnow()+datetime.timedelta(seconds=$secs)).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+  sql "UPDATE users SET plan='premium', plan_expires_at='$expiry_iso', tokens_limit_daily=$LIM WHERE id='$UID2';"
+  c_grn "Granted Premium to $UID2 until $expiry_iso (limit=$LIM/day)."
+}
+
+_extend_uid() {
+  local UID2="$1"
+  [ -z "$UID2" ] && return
+  local plan cur
+  plan="$(sql "SELECT IFNULL(plan,'free') FROM users WHERE id='$UID2';")"
+  cur="$(sql "SELECT IFNULL(plan_expires_at,'') FROM users WHERE id='$UID2';")"
+  if [ "$plan" != "premium" ] || [ -z "$cur" ]; then
+    c_yel "User is not premium yet. Use Grant instead."; return
+  fi
+  printf "Current expiry: %s\n" "$cur"
+  read -rp "Extra duration (e.g. 7d, 24h, 1mo): " DUR
+  [ -z "$DUR" ] && { c_yel "Cancelled."; return; }
+  local secs
+  if ! secs="$(parse_duration_to_seconds "$DUR")"; then c_red "Invalid."; return; fi
+  local new_iso
+  new_iso="$(date -u -d "$cur + $secs seconds" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+  if [ -z "$new_iso" ]; then c_red "Could not compute new expiry."; return; fi
+  sql "UPDATE users SET plan_expires_at='$new_iso' WHERE id='$UID2';"
+  c_grn "New expiry for $UID2: $new_iso"
+}
+
+_revoke_uid() {
+  local UID2="$1"
+  [ -z "$UID2" ] && return
+  sql "UPDATE users SET plan='free', plan_expires_at=NULL, tokens_limit_daily=2000000 WHERE id='$UID2';"
+  c_grn "Revoked. $UID2 is now Free (limit reset to 2,000,000/day)."
+}
+
+_set_limit_uid() {
+  local UID2="$1"
+  [ -z "$UID2" ] && return
+  read -rp "New daily token limit (e.g. 10000000): " V
+  [ -z "$V" ] && { c_yel "Cancelled."; return; }
+  if ! [[ "$V" =~ ^[0-9]+$ ]]; then c_red "Must be integer."; return; fi
+  sql "UPDATE users SET tokens_limit_daily=$V WHERE id='$UID2';"
+  c_grn "Updated $UID2 limit to $V/day."
+}
+
+_reset_tokens_uid() {
+  local UID2="$1"
+  [ -z "$UID2" ] && return
+  sql "UPDATE users SET tokens_used_today=0 WHERE id='$UID2';"
+  c_grn "Reset $UID2 tokens_used_today=0."
+}
+
 action_list_users() {
   c_bld "=== Users ==="
-  sql ".headers on" ".mode column" "SELECT id, IFNULL(email,'') AS email, IFNULL(display_name,'') AS name, tokens_used_today AS used, tokens_limit_daily AS limit, tokens_reset_at AS reset FROM users ORDER BY tokens_used_today DESC;"
+  # Get rows: id|email|display_name|plan|expires|used|limit
+  local IFS_BACKUP="$IFS"
+  mapfile -t rows < <(sql "SELECT id || '|' || IFNULL(email,'') || '|' || IFNULL(display_name,'') || '|' || IFNULL(plan,'free') || '|' || IFNULL(plan_expires_at,'') || '|' || tokens_used_today || '|' || tokens_limit_daily FROM users ORDER BY (plan='premium') DESC, tokens_used_today DESC LIMIT 200;")
+  if [ "${#rows[@]}" -eq 0 ]; then c_yel "No users yet."; press_enter; return; fi
+
+  printf "  %-3s  %-9s  %-32s  %-20s  %-19s  %s\n" "#" "Plan" "Email" "Name" "Expires" "Tokens"
+  printf "  %s\n" "------------------------------------------------------------------------------------------------------------"
+  local i=0
+  for row in "${rows[@]}"; do
+    i=$((i+1))
+    IFS='|' read -r rid remail rname rplan rexpires rused rlimit <<<"$row"
+    local badge="Free"
+    [ "$rplan" = "premium" ] && badge="★PREMIUM"
+    printf "  %-3s  %-9s  %-32s  %-20s  %-19s  %s/%s\n" \
+      "$i" "$badge" "${remail:0:32}" "${rname:0:20}" "${rexpires:0:19}" "$rused" "$rlimit"
+  done
+  IFS="$IFS_BACKUP"
+  echo
+  read -rp "Pick row # for actions (Enter to exit): " PICK
+  if [ -z "$PICK" ]; then return; fi
+  if ! [[ "$PICK" =~ ^[0-9]+$ ]] || [ "$PICK" -lt 1 ] || [ "$PICK" -gt "${#rows[@]}" ]; then
+    c_red "Invalid #."; press_enter; return
+  fi
+  local picked="${rows[$((PICK-1))]}"
+  IFS='|' read -r SEL_ID SEL_EMAIL SEL_NAME SEL_PLAN SEL_EXP SEL_USED SEL_LIMIT <<<"$picked"
+  user_action_menu "$SEL_ID" "$SEL_EMAIL" "$SEL_NAME" "$SEL_PLAN" "$SEL_EXP"
+}
+
+user_action_menu() {
+  local UID2="$1" EMAIL="$2" NAME="$3" PLAN="$4" EXP="$5"
+  while true; do
+    echo
+    c_bld "--- Selected user ---"
+    printf "  ID:      %s\n" "$UID2"
+    printf "  Email:   %s\n" "$EMAIL"
+    printf "  Name:    %s\n" "$NAME"
+    printf "  Plan:    %s\n" "$PLAN"
+    printf "  Expires: %s\n" "${EXP:-—}"
+    echo
+    echo "  1) Salin User ID (clipboard via OSC52 + print full)"
+    echo "  2) Grant Premium (donor)"
+    echo "  3) Extend Premium"
+    echo "  4) Revoke Premium"
+    echo "  5) Set token limit"
+    echo "  6) Reset tokens hari ini"
+    echo "  0) Back"
+    read -rp "Action: " a
+    case "$a" in
+      1)
+         osc52_copy "$UID2"
+         echo
+         c_cyn "User ID (highlight to copy):"
+         printf "  %s\n" "$UID2"
+         c_grn "(also sent to clipboard via OSC52 if your terminal supports it)"
+         press_enter
+         ;;
+      2) _grant_uid "$UID2";    PLAN="premium"; EXP="$(sql "SELECT IFNULL(plan_expires_at,'') FROM users WHERE id='$UID2';")"; press_enter ;;
+      3) _extend_uid "$UID2";   EXP="$(sql "SELECT IFNULL(plan_expires_at,'') FROM users WHERE id='$UID2';")"; press_enter ;;
+      4) _revoke_uid "$UID2";   PLAN="free"; EXP="" ; press_enter ;;
+      5) _set_limit_uid "$UID2";press_enter ;;
+      6) _reset_tokens_uid "$UID2"; press_enter ;;
+      0|"") return ;;
+      *) c_red "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+# Parse duration strings like '24h', '7d', '3mo', '90m', or bare number (interpreted as days)
+parse_duration_to_seconds() {
+  local s="$1"
+  if [[ "$s" =~ ^([0-9]+)$ ]]; then
+    # bare number = days
+    echo $(( ${BASH_REMATCH[1]} * 86400 ))
+    return 0
+  fi
+  if [[ "$s" =~ ^([0-9]+)(s|m|h|d|w|mo|y)$ ]]; then
+    local n="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      s)  echo $(( n )) ;;
+      m)  echo $(( n * 60 )) ;;
+      h)  echo $(( n * 3600 )) ;;
+      d)  echo $(( n * 86400 )) ;;
+      w)  echo $(( n * 604800 )) ;;
+      mo) echo $(( n * 2592000 )) ;;
+      y)  echo $(( n * 31536000 )) ;;
+    esac
+    return 0
+  fi
+  return 1
+}
+
+action_grant_premium() {
+  c_bld "=== Donate / Grant Premium to a user ==="
+  read -rp "User id (uid) or email substring (or leave empty to pick from list): " Q
+  if [ -z "$Q" ]; then action_list_users; return; fi
+  local matches
+  matches="$(sql "SELECT id || ' | ' || IFNULL(email,'') || ' | ' || IFNULL(display_name,'') || ' | plan=' || IFNULL(plan,'free') FROM users WHERE id LIKE '%$Q%' OR email LIKE '%$Q%' LIMIT 20")"
+  if [ -z "$matches" ]; then c_red "No users match."; press_enter; return; fi
+  printf "Matches:\n%s\n" "$matches"
+  read -rp "Exact user id to upgrade: " UID2
+  _grant_uid "$UID2"
+  press_enter
+}
+
+action_extend_premium() {
+  c_bld "=== Extend Premium duration ==="
+  read -rp "User id: " UID2
+  _extend_uid "$UID2"
+  press_enter
+}
+
+action_revoke_premium() {
+  c_bld "=== Revoke Premium ==="
+  read -rp "User id: " UID2
+  _revoke_uid "$UID2"
   press_enter
 }
 
 action_reset_user_tokens() {
   c_bld "=== Reset today's token usage for a user ==="
   read -rp "User id: " UID2
-  [ -z "$UID2" ] && { c_yel "Cancelled."; return; }
-  sql "UPDATE users SET tokens_used_today=0 WHERE id='$UID2';"
-  c_grn "Done."
+  _reset_tokens_uid "$UID2"
   press_enter
 }
 
@@ -221,12 +405,18 @@ show_menu() {
   echo "  4) Update default model"
   echo "  5) Set default daily token limit (all users)"
   echo "  6) Set token limit for one user (donor)"
-  echo "  7) List users"
-  echo "  8) Reset today's token usage for a user"
-  echo "  9) Restart service (pm2 restart)"
-  echo " 10) View live logs"
-  echo " 11) git pull + rebuild + restart"
-  echo " 12) View current .env"
+  c_yel " ─── Donate / Premium ───"
+  echo "  7) Grant Premium to user (donor)"
+  echo "  8) Extend Premium duration"
+  echo "  9) Revoke Premium"
+  c_yel " ─── Users ───"
+  echo " 10) List users (interactive: pick row → actions)"
+  echo " 11) Reset today's token usage for a user"
+  c_yel " ─── Service ───"
+  echo " 12) Restart service (pm2 restart)"
+  echo " 13) View live logs"
+  echo " 14) git pull + rebuild + restart"
+  echo " 15) View current .env"
   echo "  0) Exit to shell"
   echo
   read -rp "Choose an option: " choice
@@ -244,12 +434,15 @@ main() {
       4) action_update_model ;;
       5) action_default_limit ;;
       6) action_set_user_limit ;;
-      7) action_list_users ;;
-      8) action_reset_user_tokens ;;
-      9) action_restart ;;
-      10) action_logs ;;
-      11) action_update_repo ;;
-      12) action_view_env ;;
+      7) action_grant_premium ;;
+      8) action_extend_premium ;;
+      9) action_revoke_premium ;;
+      10) action_list_users ;;
+      11) action_reset_user_tokens ;;
+      12) action_restart ;;
+      13) action_logs ;;
+      14) action_update_repo ;;
+      15) action_view_env ;;
       0|q|Q|exit) c_grn "Bye."; exit 0 ;;
       *) c_red "Invalid choice."; sleep 1 ;;
     esac
