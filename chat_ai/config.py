@@ -22,6 +22,7 @@ class Config:
     api_base_url: str
     api_key: str
     default_model: str
+    state_dir: Path
     sessions_dir: Path
     workspaces_dir: Path
     log_dir: Path
@@ -47,10 +48,10 @@ class Config:
                 d.mkdir(parents=True, exist_ok=True)
             except PermissionError:
                 # Fallback to user-local state (developer mode).
-                home_base = Path.home() / ".local" / "share" / "suzu-ai"
-                sessions = home_base / "sessions"
-                workspaces = home_base / "workspaces"
-                logs = home_base / "logs"
+                base = Path.home() / ".local" / "share" / "suzu-ai"
+                sessions = base / "sessions"
+                workspaces = base / "workspaces"
+                logs = base / "logs"
                 for dd in (sessions, workspaces, logs):
                     dd.mkdir(parents=True, exist_ok=True)
                 break
@@ -59,6 +60,7 @@ class Config:
             api_base_url=_env("AI_API_BASE_URL", "https://core.fiqstr.com/v1").rstrip("/"),
             api_key=_env("AI_API_KEY", ""),
             default_model=_env("AI_DEFAULT_MODEL", "fiqstr/claude-sonnet-4.6-thinking-agentic"),
+            state_dir=base,
             sessions_dir=sessions,
             workspaces_dir=workspaces,
             log_dir=logs,
