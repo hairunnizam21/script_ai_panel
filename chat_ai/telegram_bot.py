@@ -55,7 +55,7 @@ from .api import APIError, ChatClient
 from .config import Config
 from .context import strip_hallucinated_protocols
 from .prompts import render_system_prompt
-from .runner import run_turn, summarize_tool_output
+from .runner import run_turn
 from .state import Session, list_sessions
 from .tools import ToolContext, build_default_registry
 
@@ -82,8 +82,35 @@ TELEGRAM_GETFILE_LIMIT = 20 * 1024 * 1024
 # Default poll timeout sent to ``getUpdates``.  Telegram supports up to 50 s.
 POLL_TIMEOUT_S = 30
 
-# Frames for the animated status "card" we keep editing while a turn runs.
-_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+# Simple status prefix — no animated spinner frames.
+_STATUS_PREFIX = "⏳"
+
+# Casual greetings that get a fast canned reply without hitting the model.
+# Matched after lowercasing and stripping punctuation/emoji.
+_GREETING_WORDS: set[str] = {
+    "hai", "hi", "hey", "helo", "hello", "halo", "assalamualaikum",
+    "salam", "yo", "weh", "woi", "oi", "sup", "ok", "okay", "test",
+    "bro", "bang", "apa khabar", "good morning", "good night",
+    "morning", "pagi", "malam", "petang", "selamat",
+}
+_GREETING_REPLIES: list[str] = [
+    "Hai! Ada apa boleh saya bantu?",
+    "Hey! Nak buat apa hari ni?",
+    "Yo, sedia. Hantar APK atau bagi arahan.",
+    "Salam! Ada task?",
+]
+
+
+def _is_casual_greeting(text: str) -> bool:
+    """Return True if text is just a short greeting with no real task."""
+    import re as _re
+    clean = _re.sub(r"[^\w\s]", "", text.lower()).strip()
+    if not clean or len(clean) > 60:
+        return False
+    return clean in _GREETING_WORDS or any(
+        clean.startswith(g) and len(clean) - len(g) < 15
+        for g in _GREETING_WORDS
+    )
 
 # Friendly, user-facing phase labels per tool (keeps status professional
 # instead of leaking raw tool names / output).
@@ -904,6 +931,14 @@ class Bot:
             if self._handle_command(msg, text):
                 return
 
+        # Fast-reply for casual greetings — no model call needed.
+        if user_instruction and not any(
+            k in msg for k in ("document", "photo", "video", "audio", "voice", "animation")
+        ) and _is_casual_greeting(user_instruction):
+            import random
+            self.api.send_message(chat_id, random.choice(_GREETING_REPLIES))
+            return
+
         # Make sure we have a session before downloading anything, so files
         # land inside the workspace.
         session = self.binding.session_for(chat_id, model=self.cfg.default_model)
@@ -929,11 +964,6 @@ class Bot:
                 f"User uploaded file: {p} (size {p.stat().st_size} bytes)"
                 for p in downloaded
             ]
-            ack = "\n".join(
-                f"📥 saved: `{p.name}` → `{p}` ({_human_size(p.stat().st_size)})"
-                for p in downloaded
-            )
-            self.api.send_message(chat_id, ack, parse_mode="Markdown")
             text = (text + "\n\n" + "\n".join(note_lines)).strip() if text else "\n".join(note_lines)
 
         # Surface download failures to the user. Previously these were logged
@@ -949,8 +979,15 @@ class Bot:
                 parse_mode="Markdown",
             )
 
-        # If the user dropped an APK/AAB without saying what to do, don't just
-        # start hammering away — ask first (inline buttons), like a pro analyst.
+        # If user has pending APK files from an earlier upload and now sends
+        # a text instruction, attach those files so the model knows about them.
+        if not downloaded and user_instruction:
+            pending = self._pending_files.pop(chat_id, None)
+            if pending:
+                note_lines = [f"Fail APK: {f}" for f in pending]
+                text = text + "\n\n" + "\n".join(note_lines)
+
+        # If the user dropped an APK/AAB without saying what to do, ask first.
         apk_uploads = [
             p for p in downloaded if p.suffix.lower() in _FINAL_ARTIFACT_EXTS
         ]
@@ -1066,6 +1103,9 @@ class Bot:
         if head in ("/clear", "/reset"):
             self._cmd_clear(chat_id)
             return True
+        if head == "/cleanup":
+            self._cmd_cleanup(chat_id)
+            return True
         if head == "/model":
             self._cmd_model(chat_id, rest)
             return True
@@ -1128,8 +1168,8 @@ class Bot:
             "  /status — status tools di server\n"
             "  /new — start session baru (history kosong)\n"
             "  /clear (atau /reset) — kosongkan history sesi semasa\n"
-            "     (guna kalau bot mula merepek atau ulang benda yang awak\n"
-            "      tak pernah cakap — history mungkin tercemar)\n"
+            "  /cleanup — padam fail compiled/decompiled dalam workspace\n"
+            "     (jimat ruang server, uploads kekal)\n"
             "  /sessions — list session\n"
             "  /workspace — print path workspace\n"
             "  /model NAME — tukar model\n"
@@ -1242,6 +1282,20 @@ class Bot:
             chat_id,
             "🧹 History dikosongkan. Hantar task baru — fresh slate.",
         )
+
+    def _cmd_cleanup(self, chat_id: int) -> None:
+        """Delete workspace files for this chat's session to free disk space."""
+        session = self.binding.session_for(chat_id, model=self.cfg.default_model)
+        ws = Path(session.workspace)
+        freed = _cleanup_workspace(ws)
+        if freed > 0:
+            self.api.send_message(
+                chat_id,
+                f"🗑️ Workspace dibersihkan — {_human_size(freed)} dibebaskan."
+                f"\nKalau nak buat kerja baru, hantar APK semula.",
+            )
+        else:
+            self.api.send_message(chat_id, "Workspace sudah kosong, tiada apa nak dipadam.")
 
     def _cmd_model(self, chat_id: int, rest: str) -> None:
         session = self.binding.session_for(chat_id, model=self.cfg.default_model)
@@ -1595,64 +1649,50 @@ class Bot:
         *,
         reply_to: Optional[int] = None,
     ) -> None:
-        # Initial status message we'll keep editing into a small live "card".
-        start_ts = time.time()
         try:
             status_msg = self.api.send_message(
-                chat_id, "🤖 Suzu sedang berfikir…", reply_to=reply_to
+                chat_id, f"{_STATUS_PREFIX} Memproses…", reply_to=reply_to
             )
         except TelegramError as e:
             log.warning("could not send status message: %s", e)
             status_msg = None
         status_msg_id: Optional[int] = (status_msg or {}).get("message_id")
 
-        # Throttled status editor — Telegram rate-limits edits.
+        # Minimal status updates — only update on phase changes, throttled.
         last_edit_ts = [0.0]
-        spin = [0]
-        steps = [0]
         last_text = [""]
 
         def render(phase: str, detail: str = "", *, force: bool = False) -> None:
             if status_msg_id is None:
                 return
             now = time.time()
-            if not force and now - last_edit_ts[0] < 0.7:
+            if not force and now - last_edit_ts[0] < 2.0:
                 return
-            frame = _SPINNER[spin[0] % len(_SPINNER)]
-            spin[0] += 1
-            elapsed = int(now - start_ts)
-            lines = [f"{frame} *{phase}*"]
-            if detail:
-                lines.append(f"`{detail[:120]}`")
-            lines.append(f"🧩 langkah {steps[0]} · ⏱️ {elapsed}s")
-            body = "\n".join(lines)
+            body = f"{_STATUS_PREFIX} {phase}"
             if body == last_text[0]:
                 return
             last_text[0] = body
             last_edit_ts[0] = now
             try:
-                self.api.edit_message_text(
-                    chat_id, status_msg_id, body, parse_mode="Markdown"
-                )
+                self.api.edit_message_text(chat_id, status_msg_id, body)
             except TelegramError as e:
                 log.debug("edit status failed: %s", e)
 
         # Snapshot files in workspace before the turn so we can detect new ones.
         pre_files = _snapshot_files(Path(session.workspace))
 
+        first_event = [True]
+
         def on_event(kind: str, payload: dict[str, Any]) -> None:
             if kind == "thinking":
-                render("Menganalisis…", force=steps[0] == 0)
+                if first_event[0]:
+                    render("Menganalisis…", force=True)
+                    first_event[0] = False
             elif kind == "tool_start":
-                steps[0] += 1
                 name = payload.get("name", "tool")
                 render(_phase_label(name), force=True)
-            elif kind == "tool_end":
-                name = payload.get("name", "tool")
-                summary = summarize_tool_output(name, payload.get("output", ""))
-                render(_phase_label(name), summary, force=True)
             elif kind == "error":
-                render("Ralat", payload.get("error", "error"), force=True)
+                render("Ralat", force=True)
 
         ctx = ToolContext(workspace=Path(session.workspace), debug=self.cfg.debug)
         with TypingPing(self.api, chat_id):
@@ -1728,6 +1768,14 @@ class Bot:
             except TelegramError as e:
                 log.warning("send_document failed for %s: %s", fp, e)
 
+        # Auto-cleanup workspace after delivery to save server space.
+        # Only for Telegram sessions — CLI sessions keep files.
+        if to_send:
+            ws = Path(session.workspace)
+            freed = _cleanup_workspace(ws, keep=to_send)
+            if freed > 0:
+                log.info("auto-cleanup chat %s: freed %s", chat_id, _human_size(freed))
+
 
 # --------------------------------------------------------------------------- #
 # Workspace helpers
@@ -1738,6 +1786,42 @@ class Bot:
 # (decompiled smali/java, resources, modified images, class files, logs) is
 # intermediate and must be handed over explicitly via the `deliver` tool.
 _FINAL_ARTIFACT_EXTS = {".apk", ".aab", ".apks", ".xapk"}
+
+
+def _cleanup_workspace(ws: Path, *, keep: Iterable[Path] = ()) -> int:
+    """Delete all files in a workspace directory, returning bytes freed.
+
+    Files listed in ``keep`` are preserved (e.g. freshly delivered APKs that
+    may still be referenced by the session JSON).  The ``uploads/`` subfolder
+    is also preserved so the user's original uploads remain available if they
+    want to start a new task from the same file.
+    """
+    keep_set = {p.resolve() for p in keep}
+    freed = 0
+    if not ws.exists():
+        return freed
+    for p in sorted(ws.rglob("*"), reverse=True):
+        if p.resolve() in keep_set:
+            continue
+        # Keep uploads/ — user's original files
+        try:
+            rel = p.relative_to(ws)
+        except ValueError:
+            continue
+        if rel.parts and rel.parts[0] == "uploads":
+            continue
+        if p.is_file():
+            try:
+                freed += p.stat().st_size
+                p.unlink()
+            except OSError:
+                pass
+        elif p.is_dir():
+            try:
+                p.rmdir()  # only removes empty dirs
+            except OSError:
+                pass
+    return freed
 
 
 def _snapshot_files(root: Path) -> dict[Path, float]:
