@@ -27,7 +27,19 @@ The returned list is a fresh copy; ``session.messages`` is never mutated.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
+
+# Patterns that indicate a hallucinated "protocol" the model invented.
+# When these appear in an assistant message's content we scrub the text
+# so the model never sees them again on subsequent turns.
+_HALLUCINATION_RE = re.compile(
+    r"(?i)"
+    r"(?:protokol|protocol)\s+chunked\s+write"
+    r"|≤\s*\d+\s*baris\s+per\s+operasi"
+    r"|surgical\s+edit(?:s)?\s+(?:protocol|untuk)"
+    r"|append\s+(?:protocol|berchunk|untuk\s+fail\s+besar)",
+)
 
 
 def _approx_len(message: dict[str, Any]) -> int:
@@ -70,6 +82,24 @@ def _compact_tool_message(message: dict[str, Any], cap: int) -> dict[str, Any]:
     return out
 
 
+def _sanitize_assistant(message: dict[str, Any]) -> dict[str, Any]:
+    """Strip hallucinated protocol references from an assistant message."""
+    content = message.get("content")
+    if not isinstance(content, str) or not _HALLUCINATION_RE.search(content):
+        return message
+    # Remove lines containing the hallucinated patterns.
+    cleaned_lines = [
+        line for line in content.splitlines()
+        if not _HALLUCINATION_RE.search(line)
+    ]
+    cleaned = "\n".join(cleaned_lines).strip()
+    if not cleaned:
+        cleaned = "(ok)"
+    out = dict(message)
+    out["content"] = cleaned
+    return out
+
+
 def _split_turns(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Group non-system messages into turns.
 
@@ -103,11 +133,15 @@ def prune_messages(
     system = [m for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
 
-    # Cap oversized tool results everywhere up front.
-    capped = [
-        _compact_tool_message(m, tool_result_char_cap) if m.get("role") == "tool" else m
-        for m in rest
-    ]
+    # Cap oversized tool results and scrub hallucinated protocols.
+    capped: list[dict[str, Any]] = []
+    for m in rest:
+        if m.get("role") == "tool":
+            capped.append(_compact_tool_message(m, tool_result_char_cap))
+        elif m.get("role") == "assistant":
+            capped.append(_sanitize_assistant(m))
+        else:
+            capped.append(m)
 
     turns = _split_turns(capped)
     if not turns:

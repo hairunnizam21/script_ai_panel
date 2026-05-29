@@ -53,6 +53,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from .api import APIError, ChatClient
 from .config import Config
+from .context import _HALLUCINATION_RE
 from .prompts import render_system_prompt
 from .runner import run_turn, summarize_tool_output
 from .state import Session, list_sessions
@@ -1657,6 +1658,13 @@ class Bot:
             except Exception as e:  # noqa: BLE001
                 log.exception("agent crashed")
                 final_text = f"Internal error: {e}"
+
+        # Strip any hallucinated protocol lines the model may still produce.
+        if final_text and _HALLUCINATION_RE.search(final_text):
+            final_text = "\n".join(
+                ln for ln in final_text.splitlines()
+                if not _HALLUCINATION_RE.search(ln)
+            ).strip() or "(ok)"
 
         # Replace the status message with the first chunk of the answer.
         chunks = list(_chunk_message(final_text or "(empty response)"))
