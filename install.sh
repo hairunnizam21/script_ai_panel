@@ -18,9 +18,11 @@ REPO_URL="${SUZU_REPO_URL:-https://github.com/hairunnizam21/suzu-ai-web.git}"
 INSTALL_DIR="${SUZU_INSTALL_DIR:-/var/www/suzu-ai-web}"
 ADMIN_LINK="${SUZU_ADMIN_LINK:-/usr/local/bin/suzu-admin}"
 CHAT_LINK="${SUZU_CHAT_LINK:-/usr/local/bin/suzu-chat-ai}"
+BOT_LINK="${SUZU_BOT_LINK:-/usr/local/bin/suzu-telegram-bot}"
 PANEL_DIR="${SUZU_PANEL_DIR:-/opt/suzu-panel}"
 STATE_DIR="${SUZU_STATE_DIR:-/var/lib/suzu-ai}"
 INSTALL_WEB="${SUZU_INSTALL_WEB:-0}"
+INSTALL_BOT="${SUZU_INSTALL_BOT:-1}"
 NODE_MAJOR="${SUZU_NODE_MAJOR:-20}"
 BRANCH="${SUZU_BRANCH:-main}"
 
@@ -263,6 +265,37 @@ chmod +x "$PANEL_DIR/bin/suzu-chat-ai" "$PANEL_DIR/suzu-admin.sh" 2>/dev/null ||
 c_bld "==> Installing 'suzu-admin' and 'suzu-chat-ai' commands"
 ln -sf "$PANEL_DIR/suzu-admin.sh"      "$ADMIN_LINK"
 ln -sf "$PANEL_DIR/bin/suzu-chat-ai"   "$CHAT_LINK"
+if [ -f "$PANEL_DIR/bin/suzu-telegram-bot" ]; then
+  chmod +x "$PANEL_DIR/bin/suzu-telegram-bot" 2>/dev/null || true
+  ln -sf "$PANEL_DIR/bin/suzu-telegram-bot" "$BOT_LINK"
+fi
+
+# -----------------------------------------------------------------------------
+# Optional: install the Telegram bot systemd unit so the bot keeps running
+# in the background and auto-starts at boot.  Set SUZU_INSTALL_BOT=0 to skip.
+# The user still needs to populate TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWED_USER_IDS
+# in the env file before the bot will start successfully.
+# -----------------------------------------------------------------------------
+if [ "$INSTALL_BOT" = "1" ] && [ -f "$PANEL_DIR/systemd/suzu-telegram-bot.service" ]; then
+  c_bld "==> Installing Telegram bot systemd unit"
+  cp -f "$PANEL_DIR/systemd/suzu-telegram-bot.service" /etc/systemd/system/suzu-telegram-bot.service
+  # Make the unit point at the env file we're actually using on this box so
+  # ``EnvironmentFile=`` resolves without manual editing.
+  if [ -f "$ENV_FILE" ]; then
+    sed -i "s|^EnvironmentFile=-/etc/suzu-panel/.env|EnvironmentFile=-$ENV_FILE|" \
+      /etc/systemd/system/suzu-telegram-bot.service
+  fi
+  systemctl daemon-reload
+  systemctl enable suzu-telegram-bot.service >/dev/null 2>&1 || true
+  if grep -qE '^TELEGRAM_BOT_TOKEN=.+' "$ENV_FILE" 2>/dev/null \
+     && grep -qE '^TELEGRAM_ALLOWED_USER_IDS=.+' "$ENV_FILE" 2>/dev/null; then
+    systemctl restart suzu-telegram-bot.service || c_yel "  bot failed to start — check 'journalctl -u suzu-telegram-bot -e'"
+    c_grn "  bot service restarted"
+  else
+    c_yel "  TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_USER_IDS not set in $ENV_FILE — bot left disabled."
+    c_yel "  Add them and run: systemctl restart suzu-telegram-bot"
+  fi
+fi
 
 # Optional bashrc hook so admin menu auto-launches on SSH login
 BASHRC_HOOK_FILE="/etc/profile.d/suzu-admin-banner.sh"
@@ -284,3 +317,6 @@ if [ "$INSTALL_WEB" = "1" ]; then
 fi
 c_grn "    Admin TUI:  suzu-admin"
 c_grn "    Chat AI:    suzu-chat-ai     (or option 19 inside suzu-admin)"
+if [ "$INSTALL_BOT" = "1" ]; then
+  c_grn "    Telegram:   suzu-telegram-bot (systemd: suzu-telegram-bot.service)"
+fi

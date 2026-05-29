@@ -518,6 +518,63 @@ action_chat_ai() {
   fi
 }
 
+action_telegram_bot() {
+  c_bld "=== Suzu Telegram Bot ==="
+  local token_set ids_set
+  token_set="$(env_get TELEGRAM_BOT_TOKEN)"
+  ids_set="$(env_get TELEGRAM_ALLOWED_USER_IDS)"
+  local status
+  if systemctl is-active --quiet suzu-telegram-bot.service 2>/dev/null; then
+    status="$(printf '\033[32mrunning\033[0m')"
+  elif systemctl list-unit-files --type=service 2>/dev/null | grep -q '^suzu-telegram-bot\.service'; then
+    status="$(printf '\033[33minactive\033[0m')"
+  else
+    status="$(printf '\033[31mnot installed\033[0m')"
+  fi
+  printf "  Status     : %b\n" "$status"
+  printf "  Bot        : @%s\n" "$(env_get TELEGRAM_BOT_USERNAME)"
+  printf "  Token      : %s\n" "$([ -n "$token_set" ] && echo '<set>' || echo '<empty>')"
+  printf "  Allowed IDs: %s\n" "${ids_set:-<empty>}"
+  echo
+  echo "  1) Set TELEGRAM_BOT_TOKEN"
+  echo "  2) Set TELEGRAM_ALLOWED_USER_IDS (comma-separated)"
+  echo "  3) Set TELEGRAM_BOT_USERNAME"
+  echo "  4) Restart bot service"
+  echo "  5) Stop bot service"
+  echo "  6) Tail bot logs (journalctl -f)"
+  echo "  7) View bot status (systemctl status)"
+  echo "  0) Back"
+  read -rp "Choice: " tc
+  case "$tc" in
+    1)
+       read -rp "New TELEGRAM_BOT_TOKEN: " nt
+       [ -z "$nt" ] && return
+       env_set TELEGRAM_BOT_TOKEN "$nt"
+       c_grn "Token saved."
+       systemctl restart suzu-telegram-bot.service 2>/dev/null || true
+       ;;
+    2)
+       read -rp "New TELEGRAM_ALLOWED_USER_IDS (csv): " ni
+       [ -z "$ni" ] && return
+       env_set TELEGRAM_ALLOWED_USER_IDS "$ni"
+       c_grn "Allowed user ids saved."
+       systemctl restart suzu-telegram-bot.service 2>/dev/null || true
+       ;;
+    3)
+       read -rp "New TELEGRAM_BOT_USERNAME: " nu
+       [ -z "$nu" ] && return
+       env_set TELEGRAM_BOT_USERNAME "${nu#@}"
+       c_grn "Bot username saved."
+       ;;
+    4) systemctl restart suzu-telegram-bot.service && c_grn "Restarted." || c_red "Restart failed." ;;
+    5) systemctl stop suzu-telegram-bot.service && c_grn "Stopped." || c_red "Stop failed." ;;
+    6) journalctl -u suzu-telegram-bot.service -f --no-pager ;;
+    7) systemctl status suzu-telegram-bot.service --no-pager -l | head -30 ;;
+    *) return ;;
+  esac
+  press_enter
+}
+
 action_admin_token() {
   c_bld "=== Admin token (for APK admin panel) ==="
   local cur
@@ -579,6 +636,7 @@ show_menu() {
   echo " 18) Import backup (zip)"
   c_yel " ─── AI Assistant ───"
   echo " 19) ✨ Chat AI (build/decompile/recompile APKs, reverse engineering)"
+  echo " 20) 🤖 Telegram bot (start/stop/logs, set token, allowlist)"
   echo "  0) Exit to shell"
   echo
   read -rp "Choose an option: " choice
@@ -609,6 +667,7 @@ main() {
       17) action_backup ;;
       18) action_restore ;;
       19) action_chat_ai ;;
+      20) action_telegram_bot ;;
       0|q|Q|exit) c_grn "Bye."; exit 0 ;;
       *) c_red "Invalid choice."; sleep 1 ;;
     esac
