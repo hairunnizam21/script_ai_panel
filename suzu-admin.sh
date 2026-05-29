@@ -477,7 +477,13 @@ action_restore() {
 }
 
 action_chat_ai() {
-  c_bld "=== Suzu Chat AI ==="
+  clear
+  print_header
+  echo
+  c_bld "  ── Chat AI ──"
+  c_grn "  AI bebas: decompile / recompile / build APK A-Z, reverse engineering,"
+  c_grn "  analisis, boleh masuk website untuk test, semua jenis framework — laju."
+  echo
   if [ ! -x "$CHAT_AI_LAUNCHER" ] && ! command -v suzu-chat-ai >/dev/null 2>&1; then
     c_red "Chat AI launcher not found at $CHAT_AI_LAUNCHER."
     c_yel "Run install.sh (or 'suzu-admin' rebuild) on the latest script_ai_panel to install it."
@@ -736,43 +742,133 @@ action_admin_token() {
   press_enter
 }
 
+# Keep only the characters that can appear in a menu choice.  This also stops
+# stray escape sequences (e.g. arrow keys send ESC[A / ESC[B) from polluting the
+# prompt and triggering "Invalid choice" spam — the menus are number-driven.
+_sanitize() { printf '%s' "${1:-}" | tr -cd '0-9A-Za-z'; }
+
+# Short, prominent label for the active model, e.g. "OPUS 4.8".
+_model_label() {
+  local m short
+  m="$(env_get AI_DEFAULT_MODEL)"
+  short="$(printf '%s' "$m" | grep -oiE '(opus|sonnet|haiku|gpt)[-/ ]?[0-9.]+' | head -n1)"
+  if [ -n "$short" ]; then
+    printf '%s' "$short" | tr '[:lower:]-' '[:upper:] '
+  else
+    printf '%s' "${m:-unknown}"
+  fi
+}
+
+print_header() {
+  c_cyn "════════════════════════════════════════════"
+  c_bld "                  SUZU AI"
+  c_grn "                  $(_model_label)"
+  c_cyn "════════════════════════════════════════════"
+  printf "  Domain : %s\n" "$(env_get SUZU_DOMAIN)"
+  printf "  Model  : %s\n" "$(env_get AI_DEFAULT_MODEL)"
+}
+
+# ── 1) Update ─────────────────────────────────────────────────────────────── #
+action_update_menu() {
+  while :; do
+    clear
+    print_header
+    echo
+    c_bld "  ── Update ──"
+    echo "   1) Update domain (+ SSL)"
+    echo "   2) Update AI base URL"
+    echo "   3) Update AI API key"
+    echo "   4) Update default model"
+    echo "   5) Set default daily token limit (all users)"
+    echo
+    echo "   0) Back"
+    read -rp "Choice: " u; u="$(_sanitize "$u")"
+    case "$u" in
+      1) action_update_domain ;;
+      2) action_update_baseurl ;;
+      3) action_update_apikey ;;
+      4) action_update_model ;;
+      5) action_default_limit ;;
+      0|q|Q|"") return ;;
+      *) c_red "Invalid choice."; sleep 0.5 ;;
+    esac
+  done
+}
+
+# ── 4) Users & Premium ────────────────────────────────────────────────────── #
+action_users_premium_menu() {
+  while :; do
+    clear
+    print_header
+    echo
+    c_bld "  ── Users & Premium ──"
+    echo "   1) List users (interactive: pick row → actions)"
+    echo "   2) Set token limit for one user (donor)"
+    echo "   3) Reset today's token usage for a user"
+    echo "   4) Grant Premium to user (donor)"
+    echo "   5) Extend Premium duration"
+    echo "   6) Revoke Premium"
+    echo
+    echo "   0) Back"
+    read -rp "Choice: " u; u="$(_sanitize "$u")"
+    case "$u" in
+      1) action_list_users ;;
+      2) action_set_user_limit ;;
+      3) action_reset_user_tokens ;;
+      4) action_grant_premium ;;
+      5) action_extend_premium ;;
+      6) action_revoke_premium ;;
+      0|q|Q|"") return ;;
+      *) c_red "Invalid choice."; sleep 0.5 ;;
+    esac
+  done
+}
+
+# ── 5) Service & Backup ───────────────────────────────────────────────────── #
+action_service_backup_menu() {
+  while :; do
+    clear
+    print_header
+    echo
+    c_bld "  ── Service & Backup ──"
+    echo "   1) Restart service (pm2 restart)"
+    echo "   2) View live logs"
+    echo "   3) git pull + rebuild + restart"
+    echo "   4) View current .env"
+    echo "   5) Admin token (show / regenerate)"
+    echo "   6) Export backup (zip)"
+    echo "   7) Import backup (zip)"
+    echo
+    echo "   0) Back"
+    read -rp "Choice: " u; u="$(_sanitize "$u")"
+    case "$u" in
+      1) action_restart ;;
+      2) action_logs ;;
+      3) action_update_repo ;;
+      4) action_view_env ;;
+      5) action_admin_token ;;
+      6) action_backup ;;
+      7) action_restore ;;
+      0|q|Q|"") return ;;
+      *) c_red "Invalid choice."; sleep 0.5 ;;
+    esac
+  done
+}
+
 show_menu() {
   clear
-  c_bld "╔════════════════════════════════════════╗"
-  c_bld "║         Suzu AI — Admin Panel          ║"
-  c_bld "╚════════════════════════════════════════╝"
-  printf "  Domain:   %s\n" "$(env_get SUZU_DOMAIN)"
-  printf "  Base URL: %s\n" "$(env_get AI_API_BASE_URL)"
-  printf "  Model:    %s\n" "$(env_get AI_DEFAULT_MODEL)"
+  print_header
   echo
-  echo "  1) Update domain (+ SSL)"
-  echo "  2) Update AI base URL"
-  echo "  3) Update AI API key"
-  echo "  4) Update default model"
-  echo "  5) Set default daily token limit (all users)"
-  echo "  6) Set token limit for one user (donor)"
-  c_yel " ─── Donate / Premium ───"
-  echo "  7) Grant Premium to user (donor)"
-  echo "  8) Extend Premium duration"
-  echo "  9) Revoke Premium"
-  c_yel " ─── Users ───"
-  echo " 10) List users (interactive: pick row → actions)"
-  echo " 11) Reset today's token usage for a user"
-  c_yel " ─── Service ───"
-  echo " 12) Restart service (pm2 restart)"
-  echo " 13) View live logs"
-  echo " 14) git pull + rebuild + restart"
-  echo " 15) View current .env"
-  echo " 16) Admin token (show / regenerate)"
-  c_yel " ─── Backup ───"
-  echo " 17) Export backup (zip)"
-  echo " 18) Import backup (zip)"
-  c_yel " ─── AI Assistant ───"
-  echo " 19) ✨ Chat AI (build/decompile/recompile APKs, reverse engineering)"
-  echo " 20) 🤖 Telegram bot (start/stop/logs, set token, allowlist)"
+  echo "  1) Update            — domain, base URL, API key, model, token limit"
+  echo "  2) Chat AI           — decompile / recompile / build APK, reverse engineering"
+  echo "  3) Telegram Bot      — users, service, settings"
+  echo "  4) Users & Premium   — limits, donor premium"
+  echo "  5) Service & Backup  — restart, logs, update, env, admin token, backup"
+  echo
   echo "  0) Exit to shell"
   echo
   read -rp "Choose an option: " choice
+  choice="$(_sanitize "${choice:-}")"
 }
 
 main() {
@@ -781,27 +877,13 @@ main() {
   while true; do
     show_menu
     case "${choice:-}" in
-      1) action_update_domain ;;
-      2) action_update_baseurl ;;
-      3) action_update_apikey ;;
-      4) action_update_model ;;
-      5) action_default_limit ;;
-      6) action_set_user_limit ;;
-      7) action_grant_premium ;;
-      8) action_extend_premium ;;
-      9) action_revoke_premium ;;
-      10) action_list_users ;;
-      11) action_reset_user_tokens ;;
-      12) action_restart ;;
-      13) action_logs ;;
-      14) action_update_repo ;;
-      15) action_view_env ;;
-      16) action_admin_token ;;
-      17) action_backup ;;
-      18) action_restore ;;
-      19) action_chat_ai ;;
-      20) action_telegram_bot ;;
+      1) action_update_menu ;;
+      2) action_chat_ai ;;
+      3) action_telegram_bot ;;
+      4) action_users_premium_menu ;;
+      5) action_service_backup_menu ;;
       0|q|Q|exit) c_grn "Bye."; exit 0 ;;
+      "") : ;;
       *) c_red "Invalid choice."; sleep 1 ;;
     esac
   done
