@@ -66,10 +66,9 @@ CORE_PKGS="ca-certificates curl gnupg git \
   openjdk-17-jre-headless apktool zipalign apksigner unzip zip sqlite3 \
   build-essential whiptail file binutils \
   python3 python3-venv python3-pip"
-# APK reverse-engineering extras (Universe). Best-effort: a missing package
-# will not abort the install — the chat AI tools report a friendly error if a
-# binary is absent.
-RE_PKGS="jadx dex2jar smali baksmali aapt aapt2"
+# APK reverse-engineering extras. Best-effort via apt: a missing package
+# falls back to manual install from upstream releases below.
+RE_PKGS="aapt aapt2"
 apt_install $CORE_PKGS
 for p in $RE_PKGS; do
   if ! apt_install "$p" 2>/dev/null; then
@@ -81,6 +80,102 @@ done
 if [ "$INSTALL_WEB" = "1" ]; then
   apt_install nginx certbot python3-certbot-nginx
 fi
+
+# -----------------------------------------------------------------------------
+# Manual installs for RE tools that are no longer in Ubuntu repos (22.04+).
+# Each block is idempotent — re-running install.sh just refreshes paths.
+# -----------------------------------------------------------------------------
+TOOLS_DIR="$PANEL_DIR/tools"
+mkdir -p "$TOOLS_DIR"
+
+install_jadx() {
+  if command -v jadx >/dev/null 2>&1; then
+    c_yel "  jadx already installed: $(command -v jadx)"
+    return
+  fi
+  c_bld "==> Installing jadx (skylot/jadx)"
+  local url
+  url="$(curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest \
+    | grep -oE '"browser_download_url": "[^"]*jadx-[0-9][^"]*\.zip"' \
+    | grep -v 'gui' | head -1 | cut -d'"' -f4)"
+  if [ -z "$url" ]; then
+    c_yel "  could not determine jadx release URL — skipping"
+    return
+  fi
+  rm -rf "$TOOLS_DIR/jadx"
+  mkdir -p "$TOOLS_DIR/jadx"
+  curl -fsSL -o "$TOOLS_DIR/jadx.zip" "$url"
+  ( cd "$TOOLS_DIR/jadx" && unzip -q "$TOOLS_DIR/jadx.zip" )
+  rm -f "$TOOLS_DIR/jadx.zip"
+  chmod +x "$TOOLS_DIR/jadx/bin/jadx" "$TOOLS_DIR/jadx/bin/jadx-gui" 2>/dev/null || true
+  ln -sf "$TOOLS_DIR/jadx/bin/jadx"     /usr/local/bin/jadx
+  ln -sf "$TOOLS_DIR/jadx/bin/jadx-gui" /usr/local/bin/jadx-gui
+  c_grn "  jadx -> $(jadx --version 2>&1 | head -1)"
+}
+
+install_dex2jar() {
+  if command -v d2j-dex2jar >/dev/null 2>&1; then
+    c_yel "  dex2jar already installed"
+    return
+  fi
+  c_bld "==> Installing dex2jar (pxb1988/dex2jar)"
+  local url
+  url="$(curl -fsSL https://api.github.com/repos/pxb1988/dex2jar/releases/latest \
+    | grep -oE '"browser_download_url": "[^"]*\.zip"' | head -1 | cut -d'"' -f4)"
+  if [ -z "$url" ]; then
+    c_yel "  could not determine dex2jar release URL — skipping"
+    return
+  fi
+  rm -rf "$TOOLS_DIR/dex2jar"
+  mkdir -p "$TOOLS_DIR/dex2jar"
+  curl -fsSL -o "$TOOLS_DIR/dex2jar.zip" "$url"
+  ( cd "$TOOLS_DIR/dex2jar" && unzip -q "$TOOLS_DIR/dex2jar.zip" )
+  rm -f "$TOOLS_DIR/dex2jar.zip"
+  local bin
+  bin="$(find "$TOOLS_DIR/dex2jar" -maxdepth 3 -type d -name "dex-tools-*" | head -1)"
+  [ -z "$bin" ] && bin="$(find "$TOOLS_DIR/dex2jar" -maxdepth 3 -name "d2j_invoke.sh" -printf "%h\n" | head -1)"
+  if [ -z "$bin" ]; then
+    c_yel "  could not locate dex2jar bin/ — skipping"
+    return
+  fi
+  chmod +x "$bin"/*.sh 2>/dev/null || true
+  local f n
+  for f in "$bin"/d2j-*.sh; do
+    [ -e "$f" ] || continue
+    n="$(basename "$f" .sh)"
+    ln -sf "$f" "/usr/local/bin/$n"
+  done
+  c_grn "  d2j-dex2jar -> $(command -v d2j-dex2jar)"
+}
+
+install_smali() {
+  if command -v baksmali >/dev/null 2>&1 && command -v smali >/dev/null 2>&1; then
+    c_yel "  smali/baksmali already installed"
+    return
+  fi
+  c_bld "==> Installing smali / baksmali (JesusFreke 2.5.2)"
+  local ver="${SUZU_SMALI_VER:-2.5.2}"
+  mkdir -p "$TOOLS_DIR/smali"
+  local art url
+  for art in smali baksmali; do
+    url="https://bitbucket.org/JesusFreke/smali/downloads/$art-$ver.jar"
+    if ! curl -fsSL --fail -o "$TOOLS_DIR/smali/$art.jar" "$url"; then
+      c_yel "  failed to download $art $ver — skipping"
+      continue
+    fi
+    cat > "/usr/local/bin/$art" <<EOF
+#!/usr/bin/env bash
+exec java -jar "$TOOLS_DIR/smali/$art.jar" "\$@"
+EOF
+    chmod +x "/usr/local/bin/$art"
+  done
+  c_grn "  baksmali -> $(baksmali --version 2>&1 | head -1)"
+  c_grn "  smali    -> $(smali --version 2>&1 | head -1)"
+}
+
+install_jadx
+install_dex2jar
+install_smali
 
 if [ "$INSTALL_WEB" = "1" ]; then
   if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/v//;s/\..*//')" -lt "$NODE_MAJOR" ]; then
