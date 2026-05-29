@@ -5,9 +5,13 @@
 set -u
 
 INSTALL_DIR="${SUZU_INSTALL_DIR:-/var/www/suzu-ai-web}"
-ENV_FILE="$INSTALL_DIR/.env"
+ENV_FILE="${SUZU_ENV_FILE:-$INSTALL_DIR/.env}"
 DB_FILE="$INSTALL_DIR/suzu.db"
 SERVICE_NAME="suzu-ai"
+
+# Where the panel scripts (chat_ai/, bin/) live. Set by install.sh.
+PANEL_DIR="${SUZU_PANEL_DIR:-/opt/suzu-panel}"
+CHAT_AI_LAUNCHER="${SUZU_CHAT_AI_LAUNCHER:-$PANEL_DIR/bin/suzu-chat-ai}"
 
 c_red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 c_grn()   { printf "\033[32m%s\033[0m\n" "$*"; }
@@ -24,9 +28,20 @@ need_root() {
 
 require_install() {
   if [ ! -f "$ENV_FILE" ]; then
-    c_red "Suzu AI not installed at $INSTALL_DIR. Run install.sh first."
+    c_red "Suzu AI not installed (no env at $ENV_FILE). Run install.sh first."
     exit 1
   fi
+}
+
+# Soft check: only fail when calling an action that truly needs the legacy
+# suzu-ai-web checkout. Chat AI itself does not require it.
+require_web_install() {
+  if [ ! -d "$INSTALL_DIR" ]; then
+    c_yel "suzu-ai-web is not installed at $INSTALL_DIR."
+    c_yel "This action only applies to the legacy web panel."
+    return 1
+  fi
+  return 0
 }
 
 # Read a value from .env (returns blank if missing)
@@ -461,6 +476,48 @@ action_restore() {
   press_enter
 }
 
+action_chat_ai() {
+  c_bld "=== Suzu Chat AI ==="
+  if [ ! -x "$CHAT_AI_LAUNCHER" ] && ! command -v suzu-chat-ai >/dev/null 2>&1; then
+    c_red "Chat AI launcher not found at $CHAT_AI_LAUNCHER."
+    c_yel "Run install.sh (or 'suzu-admin' rebuild) on the latest script_ai_panel to install it."
+    press_enter
+    return
+  fi
+  local launcher
+  if [ -x "$CHAT_AI_LAUNCHER" ]; then
+    launcher="$CHAT_AI_LAUNCHER"
+  else
+    launcher="$(command -v suzu-chat-ai)"
+  fi
+  echo
+  echo "  1) Continue last session (default)"
+  echo "  2) Start a new session"
+  echo "  3) List sessions"
+  echo "  4) Resume a specific session id"
+  echo "  0) Back"
+  read -rp "Choice [1]: " cc
+  cc="${cc:-1}"
+  local rc=0
+  case "$cc" in
+    1) SUZU_ENV_FILE="$ENV_FILE" "$launcher" --last; rc=$? ;;
+    2) SUZU_ENV_FILE="$ENV_FILE" "$launcher" --new;  rc=$? ;;
+    3) SUZU_ENV_FILE="$ENV_FILE" "$launcher" --list; press_enter; return ;;
+    4)
+       read -rp "Session id: " sid
+       [ -z "$sid" ] && return
+       SUZU_ENV_FILE="$ENV_FILE" "$launcher" --resume "$sid"; rc=$?
+       ;;
+    0|"") return ;;
+    *) c_red "Invalid."; sleep 1; return ;;
+  esac
+  # Exit code 10 = /menu requested from inside chat. Exit code 0 = /exit.
+  if [ "$rc" -ne 10 ] && [ "$rc" -ne 0 ]; then
+    c_yel "Chat AI exited with code $rc."
+    press_enter
+  fi
+}
+
 action_admin_token() {
   c_bld "=== Admin token (for APK admin panel) ==="
   local cur
@@ -520,6 +577,8 @@ show_menu() {
   c_yel " ─── Backup ───"
   echo " 17) Export backup (zip)"
   echo " 18) Import backup (zip)"
+  c_yel " ─── AI Assistant ───"
+  echo " 19) ✨ Chat AI (build/decompile/recompile APKs, reverse engineering)"
   echo "  0) Exit to shell"
   echo
   read -rp "Choose an option: " choice
@@ -549,6 +608,7 @@ main() {
       16) action_admin_token ;;
       17) action_backup ;;
       18) action_restore ;;
+      19) action_chat_ai ;;
       0|q|Q|exit) c_grn "Bye."; exit 0 ;;
       *) c_red "Invalid choice."; sleep 1 ;;
     esac
