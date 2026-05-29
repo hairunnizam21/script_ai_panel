@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from . import apk, analysis, files, python_env, shell
@@ -38,6 +39,10 @@ class Tool:
 class ToolContext:
     workspace: str
     debug: bool = False
+    # Files the assistant has explicitly chosen to hand back to the user (e.g.
+    # the final signed APK).  Front-ends (the Telegram bot) read this after a
+    # turn and upload *only* these, instead of echoing every intermediate file.
+    deliverables: list[str] = field(default_factory=list)
 
 
 class ToolRegistry:
@@ -99,6 +104,26 @@ def _default(o: Any) -> Any:
         return repr(o)
 
 
+def _deliver(args: dict[str, Any], ctx: "ToolContext") -> dict[str, Any]:
+    """Hand a finished file back to the user (the only files a front-end sends)."""
+    path = args.get("path")
+    if not path:
+        return {"error": "`path` is required"}
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(ctx.workspace) / p
+    if not p.exists() or not p.is_file():
+        return {"error": f"file not found: {p}"}
+    resolved = str(p)
+    if resolved not in ctx.deliverables:
+        ctx.deliverables.append(resolved)
+    return {
+        "delivered": resolved,
+        "size": p.stat().st_size,
+        "note": "Queued to send to the user as a final deliverable.",
+    }
+
+
 def build_default_registry() -> ToolRegistry:
     reg = ToolRegistry()
     shell.register(reg, Tool)
@@ -106,4 +131,31 @@ def build_default_registry() -> ToolRegistry:
     apk.register(reg, Tool)
     analysis.register(reg, Tool)
     python_env.register(reg, Tool)
+    reg.register(
+        Tool(
+            name="deliver",
+            description=(
+                "Send a FINISHED file to the user (e.g. the final signed/aligned APK, "
+                "an AAB, or a packaged zip of the project). This is the ONLY way a file "
+                "reaches the user — intermediate artefacts (decompiled smali/java, "
+                "resources, modified images, class files) are NOT sent automatically. "
+                "Call this once at the end with the final deliverable(s)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the finished file (absolute, or relative to the workspace).",
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional short caption shown with the file.",
+                    },
+                },
+                "required": ["path"],
+            },
+            handler=_deliver,
+        )
+    )
     return reg

@@ -36,6 +36,7 @@ from .animations import (
 )
 from .api import APIError, ChatClient, ChatRequest, DeltaAccumulator
 from .config import Config
+from .context import prune_messages
 from .prompts import render_system_prompt
 from .state import Session, delete_session, latest_session_id, list_sessions
 from .tools import ToolContext, build_default_registry
@@ -336,9 +337,14 @@ def _agent_turn(client: ChatClient, registry, ctx: ToolContext, cfg: Config, ses
     for iteration in range(cfg.max_tool_iters):
         req = ChatRequest(
             model=session.model,
-            messages=session.messages,
+            messages=prune_messages(
+                session.messages,
+                char_budget=cfg.context_char_budget,
+                tool_result_char_cap=cfg.tool_result_char_cap,
+            ),
             tools=tools,
             stream=True,
+            max_tokens=cfg.max_tokens or None,
         )
         spinner = anim.Spinner(label="Thinking", color=MAGENTA)
         spinner.start()

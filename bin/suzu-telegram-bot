@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Suzu Telegram bot launcher.
+#
+# Loads the Suzu env file so AI_API_KEY / SUZU_* / TELEGRAM_* are available,
+# then execs ``python3 -m chat_ai.telegram_bot``.  Symlinked into
+# /usr/local/bin/ by install.sh.
+
+set -u
+
+# Resolve the directory this script lives in (follow symlinks).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+PANEL_DIR="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+
+ENV_FILE="${SUZU_ENV_FILE:-/var/www/suzu-ai-web/.env}"
+if [ ! -f "$ENV_FILE" ]; then
+  if [ -f "/etc/suzu-panel/.env" ]; then
+    ENV_FILE="/etc/suzu-panel/.env"
+  elif [ -f "$PANEL_DIR/.env" ]; then
+    ENV_FILE="$PANEL_DIR/.env"
+  fi
+fi
+if [ -f "$ENV_FILE" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      AI_*|SUZU_*|TELEGRAM_*|FIREBASE_*|ANDROID_*)
+        key="${line%%=*}"
+        value="${line#*=}"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+        export "$key=$value"
+        ;;
+    esac
+  done < "$ENV_FILE"
+fi
+export SUZU_ENV_FILE="$ENV_FILE"
+
+if [ -d "$PANEL_DIR/chat_ai" ]; then
+  export PYTHONPATH="$PANEL_DIR${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
+PY="${SUZU_PYTHON:-python3}"
+if ! command -v "$PY" >/dev/null 2>&1; then
+  echo "error: python3 not found on PATH" >&2
+  exit 2
+fi
+
+exec "$PY" -m chat_ai.telegram_bot "$@"

@@ -22,6 +22,7 @@ class Config:
     api_base_url: str
     api_key: str
     default_model: str
+    state_dir: Path
     sessions_dir: Path
     workspaces_dir: Path
     log_dir: Path
@@ -30,6 +31,9 @@ class Config:
     show_tool_io: bool
     auto_approve_shell: bool
     debug: bool
+    max_tokens: int
+    context_char_budget: int
+    tool_result_char_cap: int
 
     @classmethod
     def load(cls) -> "Config":
@@ -47,10 +51,10 @@ class Config:
                 d.mkdir(parents=True, exist_ok=True)
             except PermissionError:
                 # Fallback to user-local state (developer mode).
-                home_base = Path.home() / ".local" / "share" / "suzu-ai"
-                sessions = home_base / "sessions"
-                workspaces = home_base / "workspaces"
-                logs = home_base / "logs"
+                base = Path.home() / ".local" / "share" / "suzu-ai"
+                sessions = base / "sessions"
+                workspaces = base / "workspaces"
+                logs = base / "logs"
                 for dd in (sessions, workspaces, logs):
                     dd.mkdir(parents=True, exist_ok=True)
                 break
@@ -59,6 +63,7 @@ class Config:
             api_base_url=_env("AI_API_BASE_URL", "https://core.fiqstr.com/v1").rstrip("/"),
             api_key=_env("AI_API_KEY", ""),
             default_model=_env("AI_DEFAULT_MODEL", "fiqstr/claude-sonnet-4.6-thinking-agentic"),
+            state_dir=base,
             sessions_dir=sessions,
             workspaces_dir=workspaces,
             log_dir=logs,
@@ -67,6 +72,17 @@ class Config:
             show_tool_io=_env("SUZU_SHOW_TOOL_IO", "1") not in ("0", "false", "False"),
             auto_approve_shell=_env("SUZU_AUTO_APPROVE_SHELL", "1") not in ("0", "false", "False"),
             debug=_env("SUZU_DEBUG", "0") not in ("0", "false", "False"),
+            # Upper bound on tokens the model may generate per reply. 0/empty
+            # disables the cap (let the server decide).
+            max_tokens=int(_env("SUZU_MAX_TOKENS", "8192") or 0),
+            # Approximate character budget for the conversation we resend on
+            # every model call. The full transcript is still kept on disk; we
+            # only trim what we *send* so latency stays bounded as history grows.
+            context_char_budget=int(_env("SUZU_CONTEXT_CHAR_BUDGET", "48000") or 0),
+            # Hard cap applied to each individual tool-result message before it
+            # is sent back to the model. Large dumps (decompile/aapt/strings)
+            # are truncated here; the user still receives full files.
+            tool_result_char_cap=int(_env("SUZU_TOOL_RESULT_CHAR_CAP", "8000") or 0),
         )
 
 

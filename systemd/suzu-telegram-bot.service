@@ -1,0 +1,33 @@
+[Unit]
+Description=Suzu Telegram Bot (APK reverse-engineering chat AI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Drop privileges if you don't want the bot running as root. The default user
+# is "root" because the bot may need to exec apktool, jadx, etc. from /usr/local/bin
+# and write to /var/lib/suzu-ai. Change User= below if you create a dedicated user.
+User=root
+Group=root
+
+Environment=SUZU_ENV_FILE=%E/suzu-panel/.env
+# Reload the env file from /etc/suzu-panel/.env if present so secrets aren't
+# baked into the unit file. EnvironmentFile= is "optional" via the leading "-".
+EnvironmentFile=-/etc/suzu-panel/.env
+EnvironmentFile=-/var/www/suzu-ai-web/.env
+
+ExecStart=/usr/local/bin/suzu-telegram-bot
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Reasonable hardening defaults — relax if you need broader filesystem access.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
