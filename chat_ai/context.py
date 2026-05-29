@@ -22,12 +22,35 @@ This module trims the transcript we *send* without touching what we persist:
 * System messages are always kept, regardless of budget.
 
 The returned list is a fresh copy; ``session.messages`` is never mutated.
+
+Separately, :func:`strip_hallucinated_protocols` scrubs in-place any assistant
+messages whose content matches known hallucinations (e.g. the "Protokol chunked
+write" rule that some thinking models invent on the very first reply and then
+echo every subsequent turn).  Front-ends call it once on session-load so old
+contaminated sessions auto-heal without the user having to ``/clear``.
 """
 
 from __future__ import annotations
 
 import copy
 from typing import Any
+
+
+# Phrases the model has been observed to hallucinate as "rules" the user
+# supposedly taught it. None of these appear in our real system prompt.
+# Match is case-insensitive substring; keep entries narrow to avoid clobbering
+# legitimate planning text that happens to mention "surgical edits".
+_HALLUCINATED_PROTOCOL_PHRASES: tuple[str, ...] = (
+    "protokol chunked write",
+    "protokol chunked",
+    "chunked write dah faham",
+    "chunked write protocol",
+    "≤300 baris per operasi",
+    "≤350 baris per operasi",
+    "<=300 baris per operasi",
+    "<=350 baris per operasi",
+    "append berchunk",
+)
 
 
 def _approx_len(message: dict[str, Any]) -> int:
@@ -130,3 +153,39 @@ def prune_messages(
     for turn in kept:
         out.extend(turn)
     return [copy.deepcopy(m) for m in out]
+
+
+def _is_hallucinated_protocol(message: dict[str, Any]) -> bool:
+    """Return True if ``message`` is a pure-text assistant message echoing one
+    of the known hallucinated "protocols".
+
+    We require *no* ``tool_calls`` on the message so we never drop real work —
+    the hallucination is always a text-only filler reply.
+    """
+    if message.get("role") != "assistant":
+        return False
+    if message.get("tool_calls"):
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    cl = content.lower()
+    return any(p in cl for p in _HALLUCINATED_PROTOCOL_PHRASES)
+
+
+def strip_hallucinated_protocols(messages: list[dict[str, Any]]) -> int:
+    """Remove hallucinated-protocol assistant messages from ``messages``
+    *in place*.  Returns the number of messages removed.
+
+    Safe to call on every session-load: targets only the known hallucination
+    phrases (see :data:`_HALLUCINATED_PROTOCOL_PHRASES`) on text-only assistant
+    messages, so legitimate planning text mentioning, say, "surgical edits"
+    is preserved.
+    """
+    removed = 0
+    # Walk backwards so deletions don't shift indices we still need.
+    for i in range(len(messages) - 1, -1, -1):
+        if _is_hallucinated_protocol(messages[i]):
+            del messages[i]
+            removed += 1
+    return removed

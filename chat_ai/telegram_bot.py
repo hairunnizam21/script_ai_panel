@@ -53,6 +53,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from .api import APIError, ChatClient
 from .config import Config
+from .context import strip_hallucinated_protocols
 from .prompts import render_system_prompt
 from .runner import run_turn, summarize_tool_output
 from .state import Session, list_sessions
@@ -1485,12 +1486,25 @@ class Bot:
 
     def _ensure_system_prompt(self, session: Session) -> None:
         prompt = render_system_prompt(session.workspace, session.model)
+        dirty = False
+        # Auto-heal: drop assistant messages echoing known hallucinated
+        # "protocols" (e.g. "Protokol chunked write"). Targeted to specific
+        # phrases and text-only messages, so real work is never touched.
+        removed = strip_hallucinated_protocols(session.messages)
+        if removed:
+            log.info(
+                "chat %s: stripped %d hallucinated-protocol message(s) from history",
+                session.id, removed,
+            )
+            dirty = True
         for m in session.messages:
             if m.get("role") == "system":
                 # Refresh in place so existing sessions pick up updated rules
                 # (e.g. the new deliver-only / ask-first behaviour).
                 if m.get("content") != prompt:
                     m["content"] = prompt
+                    dirty = True
+                if dirty:
                     session.save(self.cfg.sessions_dir)
                 return
         session.messages.insert(0, {"role": "system", "content": prompt})
