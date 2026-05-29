@@ -38,6 +38,7 @@ import json
 import logging
 import mimetypes
 import os
+import queue
 import shutil
 import sys
 import threading
@@ -48,7 +49,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from .api import APIError, ChatClient
 from .config import Config
@@ -71,6 +72,11 @@ TYPING_REFRESH_S = 4.0
 # caps this at 20 MB for ``getFile`` and 50 MB for uploads — we err on the
 # safe side and let the model deal with anything over the limit).
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+# Hard limit imposed by Telegram's *cloud* Bot API: getFile / file download
+# only works for files up to 20 MB. Anything bigger fails server-side with
+# "file is too big", so we detect it early and tell the user.
+TELEGRAM_GETFILE_LIMIT = 20 * 1024 * 1024
 
 # Default poll timeout sent to ``getUpdates``.  Telegram supports up to 50 s.
 POLL_TIMEOUT_S = 30
@@ -681,6 +687,45 @@ def _parse_id_list(raw: str) -> set[int]:
     return out
 
 
+class ChatWorkers:
+    """Run work on a dedicated background thread *per chat*.
+
+    The poll loop must never block: a single APK build can take many minutes,
+    and while it runs the bot still has to answer everyone else (and let the
+    same user send follow-ups). We give each chat its own FIFO queue + thread,
+    so:
+
+    * different chats run concurrently;
+    * messages within one chat stay strictly in order;
+    * ``getUpdates`` keeps polling no matter how long a turn takes.
+    """
+
+    def __init__(self) -> None:
+        self._queues: dict[int, "queue.Queue[Callable[[], None]]"] = {}
+        self._lock = threading.Lock()
+
+    def submit(self, key: int, fn: Callable[[], None]) -> None:
+        with self._lock:
+            q = self._queues.get(key)
+            if q is None:
+                q = queue.Queue()
+                self._queues[key] = q
+                threading.Thread(
+                    target=self._worker, args=(key, q), daemon=True, name=f"chat-{key}"
+                ).start()
+        q.put(fn)
+
+    def _worker(self, key: int, q: "queue.Queue[Callable[[], None]]") -> None:
+        while True:
+            fn = q.get()
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 — one bad turn must not kill the worker
+                log.exception("error in chat worker %s", key)
+            finally:
+                q.task_done()
+
+
 class Bot:
     def __init__(self, bot_cfg: BotConfig, cfg: Config):
         self.bot_cfg = bot_cfg
@@ -694,6 +739,7 @@ class Bot:
             seed_admins=bot_cfg.admin_user_ids,
         )
         self.client = ChatClient(cfg.api_base_url, cfg.api_key, timeout=cfg.request_timeout)
+        self.workers = ChatWorkers()
         me = self.api.get_me()
         approved_now = [u["id"] for u in self.users.get_approved()]
         admins_now = sorted(int(a) for a in self.users.admins)
@@ -723,10 +769,16 @@ class Bot:
                 continue
             for upd in updates:
                 offset = max(offset, upd.get("update_id", 0) + 1)
-                try:
-                    self._dispatch(upd)
-                except Exception:  # noqa: BLE001 — never let one update kill the loop
-                    log.exception("error handling update %s", upd.get("update_id"))
+                # Hand the update to the per-chat worker so a long-running turn
+                # (e.g. an APK build) never blocks polling or other chats.
+                key = _update_chat_key(upd)
+                self.workers.submit(key, lambda u=upd: self._dispatch_safely(u))
+
+    def _dispatch_safely(self, update: dict[str, Any]) -> None:
+        try:
+            self._dispatch(update)
+        except Exception:  # noqa: BLE001 — never let one update kill the worker
+            log.exception("error handling update %s", update.get("update_id"))
 
     # -- dispatch ----------------------------------------------------------- #
 
@@ -816,18 +868,19 @@ class Bot:
         self._ensure_system_prompt(session)
 
         downloaded: list[Path] = []
+        dl_errors: list[str] = []
         if "document" in msg:
-            downloaded += self._download_document(session, msg["document"])
+            downloaded += self._download_document(session, msg["document"], dl_errors)
         if "photo" in msg:
-            downloaded += self._download_photo(session, msg["photo"])
+            downloaded += self._download_photo(session, msg["photo"], dl_errors)
         if "video" in msg:
-            downloaded += self._download_document(session, msg["video"])
+            downloaded += self._download_document(session, msg["video"], dl_errors)
         if "audio" in msg:
-            downloaded += self._download_document(session, msg["audio"])
+            downloaded += self._download_document(session, msg["audio"], dl_errors)
         if "voice" in msg:
-            downloaded += self._download_document(session, msg["voice"])
+            downloaded += self._download_document(session, msg["voice"], dl_errors)
         if "animation" in msg:
-            downloaded += self._download_document(session, msg["animation"])
+            downloaded += self._download_document(session, msg["animation"], dl_errors)
 
         if downloaded:
             note_lines = [
@@ -840,6 +893,19 @@ class Bot:
             )
             self.api.send_message(chat_id, ack, parse_mode="Markdown")
             text = (text + "\n\n" + "\n".join(note_lines)).strip() if text else "\n".join(note_lines)
+
+        # Surface download failures to the user. Previously these were logged
+        # and silently swallowed, so an oversized APK looked like the AI simply
+        # "couldn't read" the file.
+        if dl_errors:
+            self.api.send_message(
+                chat_id,
+                "⚠️ Tak dapat ambil sebahagian fail:\n"
+                + "\n".join(f"• {e}" for e in dl_errors)
+                + "\n\nCadangan: hantar APK ≤ 20 MB, zip & pecahkan, atau letak di "
+                "link (Drive/MEGA) dan beri saya URL untuk `shell` muat turun.",
+                parse_mode="Markdown",
+            )
 
         if not text:
             return
@@ -1289,29 +1355,56 @@ class Bot:
 
     # -- file downloads ---------------------------------------------------- #
 
-    def _download_document(self, session: Session, doc: dict[str, Any]) -> list[Path]:
+    def _download_document(
+        self,
+        session: Session,
+        doc: dict[str, Any],
+        errors: Optional[list[str]] = None,
+    ) -> list[Path]:
+        name_hint = doc.get("file_name") or "file"
+        size = doc.get("file_size") or 0
+        # Telegram's cloud Bot API only serves getFile/download for files up to
+        # 20 MB. Bigger uploads fail server-side, so warn the user up front
+        # instead of silently dropping the file (which made the AI look like it
+        # "couldn't read" the APK).
+        if size and size > TELEGRAM_GETFILE_LIMIT:
+            if errors is not None:
+                errors.append(
+                    f"`{name_hint}` ({_human_size(size)}) terlalu besar — Telegram "
+                    f"Bot API hanya benarkan muat turun sehingga {_human_size(TELEGRAM_GETFILE_LIMIT)}."
+                )
+            return []
         try:
             info = self.api.get_file(doc["file_id"])
         except TelegramError as e:
             log.warning("getFile failed for %s: %s", doc.get("file_id"), e)
+            if errors is not None:
+                errors.append(_download_error_hint(name_hint, size, e))
             return []
         remote = info.get("file_path") or ""
         if not remote:
+            if errors is not None:
+                errors.append(f"`{name_hint}`: Telegram tak pulangkan path fail.")
             return []
-        size = info.get("file_size") or doc.get("file_size") or 0
-        if size and size > MAX_DOWNLOAD_BYTES:
-            return []
+        size = info.get("file_size") or size
         name = doc.get("file_name") or Path(remote).name or f"file_{int(time.time())}"
         dest = Path(session.workspace) / "uploads" / _safe_filename(name)
         try:
             self.api.download_file(remote, dest)
         except TelegramError as e:
             log.warning("download failed for %s: %s", remote, e)
+            if errors is not None:
+                errors.append(_download_error_hint(name, size, e))
             return []
         log.info("downloaded %s -> %s", remote, dest)
         return [dest]
 
-    def _download_photo(self, session: Session, photo_sizes: list[dict[str, Any]]) -> list[Path]:
+    def _download_photo(
+        self,
+        session: Session,
+        photo_sizes: list[dict[str, Any]],
+        errors: Optional[list[str]] = None,
+    ) -> list[Path]:
         if not photo_sizes:
             return []
         # Pick the largest variant.
@@ -1320,6 +1413,8 @@ class Bot:
             info = self.api.get_file(largest["file_id"])
         except TelegramError as e:
             log.warning("getFile photo failed: %s", e)
+            if errors is not None:
+                errors.append(_download_error_hint("photo", largest.get("file_size", 0), e))
             return []
         remote = info.get("file_path") or ""
         if not remote:
@@ -1489,6 +1584,40 @@ def _interesting_new_files(pre: dict[Path, float], post: dict[Path, float]) -> l
     # Newest first.
     new.sort(key=lambda x: post.get(x, 0.0), reverse=True)
     return new
+
+
+def _update_chat_key(update: dict[str, Any]) -> int:
+    """Routing key for the per-chat worker pool.
+
+    Updates from the same chat share a key (and thus a FIFO worker thread);
+    everything that lacks a chat id falls back to 0.
+    """
+    msg = update.get("message") or update.get("edited_message")
+    if msg:
+        chat = msg.get("chat") or {}
+        if chat.get("id") is not None:
+            return int(chat["id"])
+    cb = update.get("callback_query") or {}
+    cb_msg = cb.get("message") or {}
+    cb_chat = cb_msg.get("chat") or {}
+    if cb_chat.get("id") is not None:
+        return int(cb_chat["id"])
+    frm = cb.get("from") or {}
+    if frm.get("id") is not None:
+        return int(frm["id"])
+    return 0
+
+
+def _download_error_hint(name: str, size: int, err: Exception) -> str:
+    """Human-readable, Malay-friendly reason a Telegram download failed."""
+    msg = str(err)
+    if "too big" in msg.lower() or (size and size > TELEGRAM_GETFILE_LIMIT):
+        sz = f" ({_human_size(size)})" if size else ""
+        return (
+            f"`{name}`{sz} terlalu besar untuk Telegram Bot API "
+            f"(had {_human_size(TELEGRAM_GETFILE_LIMIT)})."
+        )
+    return f"`{name}`: {msg[:160]}"
 
 
 def _safe_filename(name: str) -> str:

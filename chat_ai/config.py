@@ -31,6 +31,9 @@ class Config:
     show_tool_io: bool
     auto_approve_shell: bool
     debug: bool
+    max_tokens: int
+    context_char_budget: int
+    tool_result_char_cap: int
 
     @classmethod
     def load(cls) -> "Config":
@@ -69,6 +72,17 @@ class Config:
             show_tool_io=_env("SUZU_SHOW_TOOL_IO", "1") not in ("0", "false", "False"),
             auto_approve_shell=_env("SUZU_AUTO_APPROVE_SHELL", "1") not in ("0", "false", "False"),
             debug=_env("SUZU_DEBUG", "0") not in ("0", "false", "False"),
+            # Upper bound on tokens the model may generate per reply. 0/empty
+            # disables the cap (let the server decide).
+            max_tokens=int(_env("SUZU_MAX_TOKENS", "8192") or 0),
+            # Approximate character budget for the conversation we resend on
+            # every model call. The full transcript is still kept on disk; we
+            # only trim what we *send* so latency stays bounded as history grows.
+            context_char_budget=int(_env("SUZU_CONTEXT_CHAR_BUDGET", "48000") or 0),
+            # Hard cap applied to each individual tool-result message before it
+            # is sent back to the model. Large dumps (decompile/aapt/strings)
+            # are truncated here; the user still receives full files.
+            tool_result_char_cap=int(_env("SUZU_TOOL_RESULT_CHAR_CAP", "8000") or 0),
         )
 
 

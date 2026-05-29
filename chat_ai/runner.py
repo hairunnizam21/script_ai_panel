@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 from .api import APIError, ChatClient, ChatRequest, DeltaAccumulator
 from .config import Config
+from .context import prune_messages
 from .state import Session
 from .tools import ToolContext, ToolRegistry
 
@@ -69,9 +70,14 @@ def run_turn(
 
         req = ChatRequest(
             model=session.model,
-            messages=session.messages,
+            messages=prune_messages(
+                session.messages,
+                char_budget=cfg.context_char_budget,
+                tool_result_char_cap=cfg.tool_result_char_cap,
+            ),
             tools=tools,
             stream=True,
+            max_tokens=cfg.max_tokens or None,
         )
         accum = DeltaAccumulator()
         try:
