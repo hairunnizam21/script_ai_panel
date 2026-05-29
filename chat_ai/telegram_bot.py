@@ -85,6 +85,33 @@ POLL_TIMEOUT_S = 30
 # Simple status prefix — no animated spinner frames.
 _STATUS_PREFIX = "⏳"
 
+# Casual greetings that get a fast canned reply without hitting the model.
+# Matched after lowercasing and stripping punctuation/emoji.
+_GREETING_WORDS: set[str] = {
+    "hai", "hi", "hey", "helo", "hello", "halo", "assalamualaikum",
+    "salam", "yo", "weh", "woi", "oi", "sup", "ok", "okay", "test",
+    "bro", "bang", "apa khabar", "good morning", "good night",
+    "morning", "pagi", "malam", "petang", "selamat",
+}
+_GREETING_REPLIES: list[str] = [
+    "Hai! Ada apa boleh saya bantu?",
+    "Hey! Nak buat apa hari ni?",
+    "Yo, sedia. Hantar APK atau bagi arahan.",
+    "Salam! Ada task?",
+]
+
+
+def _is_casual_greeting(text: str) -> bool:
+    """Return True if text is just a short greeting with no real task."""
+    import re as _re
+    clean = _re.sub(r"[^\w\s]", "", text.lower()).strip()
+    if not clean or len(clean) > 60:
+        return False
+    return clean in _GREETING_WORDS or any(
+        clean.startswith(g) and len(clean) - len(g) < 15
+        for g in _GREETING_WORDS
+    )
+
 # Friendly, user-facing phase labels per tool (keeps status professional
 # instead of leaking raw tool names / output).
 _PHASE_LABELS = {
@@ -904,6 +931,14 @@ class Bot:
             if self._handle_command(msg, text):
                 return
 
+        # Fast-reply for casual greetings — no model call needed.
+        if user_instruction and not any(
+            k in msg for k in ("document", "photo", "video", "audio", "voice", "animation")
+        ) and _is_casual_greeting(user_instruction):
+            import random
+            self.api.send_message(chat_id, random.choice(_GREETING_REPLIES))
+            return
+
         # Make sure we have a session before downloading anything, so files
         # land inside the workspace.
         session = self.binding.session_for(chat_id, model=self.cfg.default_model)
@@ -1068,6 +1103,9 @@ class Bot:
         if head in ("/clear", "/reset"):
             self._cmd_clear(chat_id)
             return True
+        if head == "/cleanup":
+            self._cmd_cleanup(chat_id)
+            return True
         if head == "/model":
             self._cmd_model(chat_id, rest)
             return True
@@ -1130,8 +1168,8 @@ class Bot:
             "  /status — status tools di server\n"
             "  /new — start session baru (history kosong)\n"
             "  /clear (atau /reset) — kosongkan history sesi semasa\n"
-            "     (guna kalau bot mula merepek atau ulang benda yang awak\n"
-            "      tak pernah cakap — history mungkin tercemar)\n"
+            "  /cleanup — padam fail compiled/decompiled dalam workspace\n"
+            "     (jimat ruang server, uploads kekal)\n"
             "  /sessions — list session\n"
             "  /workspace — print path workspace\n"
             "  /model NAME — tukar model\n"
@@ -1244,6 +1282,20 @@ class Bot:
             chat_id,
             "🧹 History dikosongkan. Hantar task baru — fresh slate.",
         )
+
+    def _cmd_cleanup(self, chat_id: int) -> None:
+        """Delete workspace files for this chat's session to free disk space."""
+        session = self.binding.session_for(chat_id, model=self.cfg.default_model)
+        ws = Path(session.workspace)
+        freed = _cleanup_workspace(ws)
+        if freed > 0:
+            self.api.send_message(
+                chat_id,
+                f"🗑️ Workspace dibersihkan — {_human_size(freed)} dibebaskan."
+                f"\nKalau nak buat kerja baru, hantar APK semula.",
+            )
+        else:
+            self.api.send_message(chat_id, "Workspace sudah kosong, tiada apa nak dipadam.")
 
     def _cmd_model(self, chat_id: int, rest: str) -> None:
         session = self.binding.session_for(chat_id, model=self.cfg.default_model)
@@ -1716,6 +1768,14 @@ class Bot:
             except TelegramError as e:
                 log.warning("send_document failed for %s: %s", fp, e)
 
+        # Auto-cleanup workspace after delivery to save server space.
+        # Only for Telegram sessions — CLI sessions keep files.
+        if to_send:
+            ws = Path(session.workspace)
+            freed = _cleanup_workspace(ws, keep=to_send)
+            if freed > 0:
+                log.info("auto-cleanup chat %s: freed %s", chat_id, _human_size(freed))
+
 
 # --------------------------------------------------------------------------- #
 # Workspace helpers
@@ -1726,6 +1786,42 @@ class Bot:
 # (decompiled smali/java, resources, modified images, class files, logs) is
 # intermediate and must be handed over explicitly via the `deliver` tool.
 _FINAL_ARTIFACT_EXTS = {".apk", ".aab", ".apks", ".xapk"}
+
+
+def _cleanup_workspace(ws: Path, *, keep: Iterable[Path] = ()) -> int:
+    """Delete all files in a workspace directory, returning bytes freed.
+
+    Files listed in ``keep`` are preserved (e.g. freshly delivered APKs that
+    may still be referenced by the session JSON).  The ``uploads/`` subfolder
+    is also preserved so the user's original uploads remain available if they
+    want to start a new task from the same file.
+    """
+    keep_set = {p.resolve() for p in keep}
+    freed = 0
+    if not ws.exists():
+        return freed
+    for p in sorted(ws.rglob("*"), reverse=True):
+        if p.resolve() in keep_set:
+            continue
+        # Keep uploads/ — user's original files
+        try:
+            rel = p.relative_to(ws)
+        except ValueError:
+            continue
+        if rel.parts and rel.parts[0] == "uploads":
+            continue
+        if p.is_file():
+            try:
+                freed += p.stat().st_size
+                p.unlink()
+            except OSError:
+                pass
+        elif p.is_dir():
+            try:
+                p.rmdir()  # only removes empty dirs
+            except OSError:
+                pass
+    return freed
 
 
 def _snapshot_files(root: Path) -> dict[Path, float]:
