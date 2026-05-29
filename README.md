@@ -1,83 +1,121 @@
-# Suzu AI — VPS panel scripts
+# Suzu AI — Terminal Panel
 
-One-shot installer and an interactive admin TUI for self-hosting
-[suzu-ai-web](https://github.com/hairunnizam21/suzu-ai-web) on a fresh
-Ubuntu VPS.
+Chat with AI **and** manage everything from your server terminal — no website
+needed. A single self-contained Bash TUI with a modern, Kali-style look.
 
-## What it sets up
+![menu](https://img.shields.io/badge/UI-Kali%20style-00c8ff) ![shell](https://img.shields.io/badge/bash-TUI-5fff87)
 
-- Node.js 20 + PM2
-- Nginx + (optional) Let's Encrypt via certbot
-- apktool + JDK 17 + zipalign + apksigner (for APK decompile/recompile)
-- The suzu-ai-web app cloned to `/var/www/suzu-ai-web`
-- A debug keystore at `server/keystores/debug.keystore`
-- A `.env` file with your API key, base URL, default model, domain
-- A global `suzu-admin` command to manage the server later
+## What it does
 
-## Install (fresh VPS)
+- **Chat AI in the terminal** — streaming replies, switch models on the fly,
+  internal `<thinking>` blocks hidden automatically.
+- **Config** — update API key, base URL, default model, domain. Changes apply
+  **instantly** (the panel reads the config live on every request — no restart).
+- **Favorite models** — save the models you use most for one-key selection.
+- **Users & Premium** — list users, grant/extend/revoke Premium, set daily token
+  limits, reset usage. (Optional — only if a SQLite user DB is present.)
+- **Backup & Restore** — export config + database to a zip, restore on any box.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/hairunnizam21/script_ai_panel/main/install.sh | sudo bash
-```
+It needs only `curl` and `jq` (plus `sqlite3` for the Users features, `zip`/`unzip`
+for backups). The installer pulls these in for you.
 
-You will be prompted for:
+## Install on a fresh server
 
-- Public domain (e.g. `suzu-ai.online`) — leave blank for IP-only
-- AI base URL (default `https://core.fiqstr.com/v1`)
-- AI API key
-- Default model
-- Firebase project ID
-
-When done, visit `https://<your-domain>/`.
-
-### Custom installer flags
-
-You can override these by exporting env vars before running:
+As root on a fresh Ubuntu/Debian box:
 
 ```bash
-SUZU_REPO_URL=https://github.com/hairunnizam21/suzu-ai-web.git \
-SUZU_BRANCH=main \
-SUZU_INSTALL_DIR=/var/www/suzu-ai-web \
-SUZU_LETSENCRYPT_EMAIL=admin@example.com \
-sudo -E bash install.sh
+curl -fsSL https://raw.githubusercontent.com/hairunnizam21/script_ai_panel/setup/install.sh | sudo bash
 ```
 
-## Daily admin
+You will be asked for:
 
-After install, just type:
+- **AI base URL** (default `https://core.fiqstr.com/v1`)
+- **AI API key**
+- **Default model** (default `fiqstr/claude-sonnet-4.6-thinking-agentic`)
+
+When it finishes, just type:
 
 ```bash
 suzu-admin
 ```
 
-The menu lets you:
+Pick **1) Chat AI** and start talking to the AI. That's it — the server is now
+your AI.
 
-1. Update domain (+ reissue SSL)
-2. Update AI base URL
-3. Update AI API key
-4. Update default model
-5. Set the global daily token limit (applies to all users)
-6. Set a per-user daily token limit (for donors)
-7. List users
-8. Reset today's token usage for a specific user
-9. Restart the service (`pm2 restart suzu-ai`)
-10. Stream live logs
-11. `git pull` + rebuild + restart
-12. View current `.env` (API key masked)
+## Daily use
 
-The default daily limit is **2,000,000 tokens per user**, reset at UTC
-midnight. Per-user limits override the default for a given user only.
+```bash
+suzu-admin
+```
 
-## Re-installing on a new VPS
+```
+  Menu Utama
+  1) Chat AI            — ngobrol dengan AI di terminal
+  2) Konfigurasi        — API key, base URL, model, domain
+  3) Users & Premium    — kelola user, grant premium, limit
+  4) Backup & Restore   — export/import config + database
+  5) Tes koneksi AI     — cek API key berfungsi
+  0) Keluar
+```
 
-When your VPS expires or you migrate, just spin up a new Ubuntu box, point
-your DNS at the new IP, and run the one-liner above. The script is
-idempotent — running it again on an existing install just updates the repo.
+Inside **Chat AI**:
+
+| Command  | Action                                   |
+|----------|------------------------------------------|
+| `/model` | Pick a model (favorites / live list)     |
+| `/new`   | Start a fresh conversation               |
+| `/exit`  | Back to the menu                         |
+
+### Updating your API key / model
+
+Every day you can rotate the key without breaking anything:
+
+1. `suzu-admin` → **2) Konfigurasi** → **1) Update API Key**
+2. The panel saves it and immediately runs a connection test.
+
+Because chat reads the config live, the **next message already uses the new key**
+— no service to restart.
+
+### Why "rate limit" happens
+
+Rate limit = the AI provider temporarily refuses requests when too many come in
+too fast (HTTP 429/500). It does **not** mean your key is broken. To reduce it:
+
+- Save several keys and rotate when one is limited.
+- Use a lighter model for everyday chat (`/model`).
+
+## Moving to a new server
+
+When your VPS expires:
+
+1. On the **old** box: `suzu-admin` → **4) Backup & Restore** → **Export** →
+   copy the resulting `*.zip` somewhere safe.
+2. On the **new** box: run the install one-liner above.
+3. `suzu-admin` → **4) Backup & Restore** → **Import** → point at your zip.
+
+Your config (and users, if any) come right back.
+
+## Configuration file
+
+All settings live in a single env file (auto-detected):
+
+- Standalone install: `/etc/suzu-ai/suzu.env`
+- Legacy `suzu-ai-web` install: `/var/www/suzu-ai-web/.env`
+
+Override the location with `SUZU_ENV_FILE=/path/to/file suzu-admin`.
+
+| Key                | Meaning                                  |
+|--------------------|------------------------------------------|
+| `AI_API_BASE_URL`  | OpenAI-compatible base URL               |
+| `AI_API_KEY`       | Your API key                             |
+| `AI_DEFAULT_MODEL` | Default chat model                       |
+| `SUZU_MODELS`      | Comma-separated favorite models          |
+| `SUZU_DOMAIN`      | Optional domain (informational)          |
 
 ## Files
 
-- `install.sh` — provisions a clean Ubuntu host
-- `suzu-admin.sh` — the admin TUI, symlinked to `/usr/local/bin/suzu-admin`
+- `install.sh` — provisions a server and installs the `suzu-admin` command
+- `suzu-admin.sh` — the terminal panel (chat + admin), symlinked to `suzu-admin`
 
 ## License
 
