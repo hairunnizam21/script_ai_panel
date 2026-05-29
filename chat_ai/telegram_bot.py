@@ -81,6 +81,43 @@ TELEGRAM_GETFILE_LIMIT = 20 * 1024 * 1024
 # Default poll timeout sent to ``getUpdates``.  Telegram supports up to 50 s.
 POLL_TIMEOUT_S = 30
 
+# Frames for the animated status "card" we keep editing while a turn runs.
+_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+# Friendly, user-facing phase labels per tool (keeps status professional
+# instead of leaking raw tool names / output).
+_PHASE_LABELS = {
+    "shell": "Menjalankan arahan",
+    "python": "Menjalankan skrip Python",
+    "run_python": "Menjalankan skrip Python",
+    "read_file": "Membaca fail",
+    "write_file": "Menulis fail",
+    "edit_file": "Menyunting fail",
+    "list_dir": "Menyemak fail",
+    "glob": "Mencari fail",
+    "grep": "Mencari dalam kod",
+    "deliver": "Menyiapkan hasil akhir",
+}
+
+
+def _phase_label(tool_name: str) -> str:
+    if tool_name in _PHASE_LABELS:
+        return _PHASE_LABELS[tool_name]
+    n = tool_name.lower()
+    if "decompile" in n:
+        return "Decompile APK"
+    if "build" in n or "recompile" in n or "compile" in n:
+        return "Build / recompile APK"
+    if "sign" in n:
+        return "Menandatangani APK"
+    if "align" in n:
+        return "Zipalign APK"
+    if "apk" in n or "aapt" in n:
+        return "Memproses APK"
+    if "analy" in n or "framework" in n:
+        return "Menganalisis"
+    return f"Menjalankan {tool_name}"
+
 
 # --------------------------------------------------------------------------- #
 # Telegram Bot API client (stdlib only)
@@ -740,6 +777,9 @@ class Bot:
         )
         self.client = ChatClient(cfg.api_base_url, cfg.api_key, timeout=cfg.request_timeout)
         self.workers = ChatWorkers()
+        # Files a user uploaded but hasn't yet told us what to do with. Keyed by
+        # chat id; the per-chat worker is the only writer/reader, so no lock.
+        self._pending_files: dict[int, list[str]] = {}
         me = self.api.get_me()
         approved_now = [u["id"] for u in self.users.get_approved()]
         admins_now = sorted(int(a) for a in self.users.admins)
@@ -858,6 +898,7 @@ class Bot:
     def _handle_message(self, msg: dict[str, Any]) -> None:
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or msg.get("caption") or "").strip()
+        user_instruction = text  # what the user actually typed (no file notes yet)
         if text.startswith("/"):
             if self._handle_command(msg, text):
                 return
@@ -907,10 +948,91 @@ class Bot:
                 parse_mode="Markdown",
             )
 
+        # If the user dropped an APK/AAB without saying what to do, don't just
+        # start hammering away — ask first (inline buttons), like a pro analyst.
+        apk_uploads = [
+            p for p in downloaded if p.suffix.lower() in _FINAL_ARTIFACT_EXTS
+        ]
+        if apk_uploads and not user_instruction:
+            self._pending_files[chat_id] = [str(p) for p in apk_uploads]
+            self._ask_apk_intent(chat_id, apk_uploads, reply_to=msg.get("message_id"))
+            return
+
         if not text:
             return
 
         self._route_to_agent(chat_id, session, text, reply_to=msg.get("message_id"))
+
+    def _ask_apk_intent(
+        self, chat_id: int, apks: list[Path], *, reply_to: Optional[int] = None
+    ) -> None:
+        names = ", ".join(f"`{p.name}`" for p in apks)
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔍 Analisa", "callback_data": "apk:analyze"},
+                    {"text": "🧩 Decompile", "callback_data": "apk:decompile"},
+                ],
+                [
+                    {"text": "🔨 Build / Recompile", "callback_data": "apk:build"},
+                    {"text": "🛠️ Fix masalah", "callback_data": "apk:fix"},
+                ],
+                [
+                    {"text": "📲 Sambung projek", "callback_data": "apk:continue"},
+                ],
+            ]
+        }
+        self.api.send_message(
+            chat_id,
+            f"📦 Dah terima {names}.\n\n*Nak buat apa dengan APK ni?*\n"
+            "Pilih di bawah, atau terus taip arahan awak.",
+            parse_mode="Markdown",
+            reply_to=reply_to,
+            reply_markup=kb,
+        )
+
+    _APK_INTENTS = {
+        "analyze": "Analisa APK ni: kenal pasti framework, struktur, permission, "
+                   "library utama, dan ringkaskan apa app ni buat.",
+        "decompile": "Decompile APK ni (smali + resources) dan ringkaskan struktur "
+                     "kod & komponen penting. Jangan hantar fail tengah-tengah.",
+        "build": "Recompile/build APK ni semula jadi APK yang ditandatangan (signed) "
+                 "& zipalign, sedia untuk dipasang. Hantar APK akhir sahaja.",
+        "fix": "Saya nak fix sesuatu dalam APK ni. Tanya saya dulu apa yang nak "
+               "dibaiki kalau belum jelas, kemudian baiki dan bina semula APK yang signed.",
+        "continue": "Sambung projek menggunakan APK ni. Tanya saya konteks projek "
+                    "kalau perlu, kemudian teruskan kerja.",
+    }
+
+    def _handle_apk_intent(
+        self, chat_id: int, action: str, *, msg_id: Optional[int] = None
+    ) -> None:
+        instruction = self._APK_INTENTS.get(action)
+        if instruction is None:
+            return
+        files = self._pending_files.pop(chat_id, [])
+        # Clear the buttons on the picker so it can't be tapped twice.
+        if msg_id is not None:
+            label = {
+                "analyze": "🔍 Analisa",
+                "decompile": "🧩 Decompile",
+                "build": "🔨 Build / Recompile",
+                "fix": "🛠️ Fix masalah",
+                "continue": "📲 Sambung projek",
+            }.get(action, action)
+            try:
+                self.api.edit_message_text(
+                    chat_id, msg_id, f"▶️ Pilihan: *{label}*",
+                    parse_mode="Markdown", reply_markup={"inline_keyboard": []},
+                )
+            except TelegramError:
+                pass
+        session = self.binding.session_for(chat_id, model=self.cfg.default_model)
+        self._ensure_system_prompt(session)
+        note = ""
+        if files:
+            note = "\n\n" + "\n".join(f"Fail APK: {f}" for f in files)
+        self._route_to_agent(chat_id, session, instruction + note)
 
     # -- commands ----------------------------------------------------------- #
 
@@ -1272,6 +1394,15 @@ class Bot:
                 self._cmd_admin_pending(chat_id)
             return
 
+        # "What to do with this APK?" picker (available to all approved users).
+        if data.startswith("apk:"):
+            if not self.users.is_approved(uid):
+                self.api.answer_callback_query(qid, text="Tak dibenarkan.", show_alert=True)
+                return
+            self.api.answer_callback_query(qid)
+            self._handle_apk_intent(chat_id, data.split(":", 1)[1], msg_id=msg_id)
+            return
+
         # Admin approve/ban actions.
         if not self.users.is_admin(uid):
             self.api.answer_callback_query(qid, text="Admin sahaja.", show_alert=True)
@@ -1346,12 +1477,17 @@ class Bot:
     # -- session helpers --------------------------------------------------- #
 
     def _ensure_system_prompt(self, session: Session) -> None:
-        if not any(m.get("role") == "system" for m in session.messages):
-            session.messages.insert(
-                0,
-                {"role": "system", "content": render_system_prompt(session.workspace, session.model)},
-            )
-            session.save(self.cfg.sessions_dir)
+        prompt = render_system_prompt(session.workspace, session.model)
+        for m in session.messages:
+            if m.get("role") == "system":
+                # Refresh in place so existing sessions pick up updated rules
+                # (e.g. the new deliver-only / ask-first behaviour).
+                if m.get("content") != prompt:
+                    m["content"] = prompt
+                    session.save(self.cfg.sessions_dir)
+                return
+        session.messages.insert(0, {"role": "system", "content": prompt})
+        session.save(self.cfg.sessions_dir)
 
     # -- file downloads ---------------------------------------------------- #
 
@@ -1438,10 +1574,11 @@ class Bot:
         *,
         reply_to: Optional[int] = None,
     ) -> None:
-        # Initial status message we'll keep editing.
+        # Initial status message we'll keep editing into a small live "card".
+        start_ts = time.time()
         try:
             status_msg = self.api.send_message(
-                chat_id, "💭 Thinking…", reply_to=reply_to
+                chat_id, "🤖 Suzu sedang berfikir…", reply_to=reply_to
             )
         except TelegramError as e:
             log.warning("could not send status message: %s", e)
@@ -1450,16 +1587,32 @@ class Bot:
 
         # Throttled status editor — Telegram rate-limits edits.
         last_edit_ts = [0.0]
+        spin = [0]
+        steps = [0]
+        last_text = [""]
 
-        def edit_status(label: str) -> None:
+        def render(phase: str, detail: str = "", *, force: bool = False) -> None:
             if status_msg_id is None:
                 return
             now = time.time()
-            if now - last_edit_ts[0] < 0.6:
+            if not force and now - last_edit_ts[0] < 0.7:
                 return
+            frame = _SPINNER[spin[0] % len(_SPINNER)]
+            spin[0] += 1
+            elapsed = int(now - start_ts)
+            lines = [f"{frame} *{phase}*"]
+            if detail:
+                lines.append(f"`{detail[:120]}`")
+            lines.append(f"🧩 langkah {steps[0]} · ⏱️ {elapsed}s")
+            body = "\n".join(lines)
+            if body == last_text[0]:
+                return
+            last_text[0] = body
             last_edit_ts[0] = now
             try:
-                self.api.edit_message_text(chat_id, status_msg_id, label)
+                self.api.edit_message_text(
+                    chat_id, status_msg_id, body, parse_mode="Markdown"
+                )
             except TelegramError as e:
                 log.debug("edit status failed: %s", e)
 
@@ -1468,16 +1621,17 @@ class Bot:
 
         def on_event(kind: str, payload: dict[str, Any]) -> None:
             if kind == "thinking":
-                edit_status("💭 Thinking…")
+                render("Menganalisis…", force=steps[0] == 0)
             elif kind == "tool_start":
+                steps[0] += 1
                 name = payload.get("name", "tool")
-                edit_status(f"🔧 Running `{name}`…")
+                render(_phase_label(name), force=True)
             elif kind == "tool_end":
                 name = payload.get("name", "tool")
                 summary = summarize_tool_output(name, payload.get("output", ""))
-                edit_status(f"↪️ `{name}` → {summary[:100]}")
+                render(_phase_label(name), summary, force=True)
             elif kind == "error":
-                edit_status(f"❗ {payload.get('error','error')[:200]}")
+                render("Ralat", payload.get("error", "error"), force=True)
 
         ctx = ToolContext(workspace=Path(session.workspace), debug=self.cfg.debug)
         with TypingPing(self.api, chat_id):
@@ -1514,15 +1668,41 @@ class Bot:
             except TelegramError as e:
                 log.warning("send chunk failed: %s", e)
 
-        # Detect new files produced in the workspace and upload them back.
-        post_files = _snapshot_files(Path(session.workspace))
-        new_files = _interesting_new_files(pre_files, post_files)
-        for fp in new_files[:5]:  # cap to avoid flooding
+        # Send files back to the user. We deliberately do NOT echo every changed
+        # file (that spammed modified images / smali / class files). Priority:
+        #   1. Files the assistant explicitly handed over via the `deliver` tool.
+        #   2. Fallback: a freshly produced final APK/AAB, if the assistant
+        #      forgot to call `deliver`.
+        to_send: list[Path] = []
+        seen: set[Path] = set()
+        for raw in ctx.deliverables:
+            fp = Path(raw)
+            if fp.is_file() and fp not in seen:
+                seen.add(fp)
+                to_send.append(fp)
+        if not to_send:
+            post_files = _snapshot_files(Path(session.workspace))
+            for fp in _new_final_artifacts(pre_files, post_files)[:2]:
+                if fp not in seen:
+                    seen.add(fp)
+                    to_send.append(fp)
+
+        for fp in to_send:
+            try:
+                size = fp.stat().st_size
+            except OSError:
+                continue
+            if size == 0 or size > 45 * 1024 * 1024:
+                self.api.send_message(
+                    chat_id,
+                    f"⚠️ `{fp.name}` ({_human_size(size)}) tak boleh dihantar terus "
+                    f"(had Telegram ~50 MB). Fail ada di `{fp}` pada server.",
+                    parse_mode="Markdown",
+                )
+                continue
             try:
                 self.api.send_document(
-                    chat_id,
-                    fp,
-                    caption=f"📦 {fp.relative_to(Path(session.workspace))} ({_human_size(fp.stat().st_size)})",
+                    chat_id, fp, caption=f"✅ {fp.name} ({_human_size(size)})"
                 )
             except TelegramError as e:
                 log.warning("send_document failed for %s: %s", fp, e)
@@ -1533,13 +1713,10 @@ class Bot:
 # --------------------------------------------------------------------------- #
 
 
-_UPLOADABLE_EXTS = {
-    ".apk", ".aab", ".jar", ".dex", ".so", ".aar",
-    ".zip", ".tar", ".gz", ".tgz",
-    ".png", ".jpg", ".jpeg", ".gif", ".webp",
-    ".txt", ".log", ".json", ".xml", ".smali", ".java", ".kt",
-    ".pdf",
-}
+# Only *final* build artefacts are auto-sent as a fallback. Everything else
+# (decompiled smali/java, resources, modified images, class files, logs) is
+# intermediate and must be handed over explicitly via the `deliver` tool.
+_FINAL_ARTIFACT_EXTS = {".apk", ".aab", ".apks", ".xapk"}
 
 
 def _snapshot_files(root: Path) -> dict[Path, float]:
@@ -1556,32 +1733,34 @@ def _snapshot_files(root: Path) -> dict[Path, float]:
     return snap
 
 
-def _interesting_new_files(pre: dict[Path, float], post: dict[Path, float]) -> list[Path]:
-    """Return files that are new (or significantly changed) and likely useful to upload."""
+def _new_final_artifacts(pre: dict[Path, float], post: dict[Path, float]) -> list[Path]:
+    """Newly produced final build artefacts (APK/AAB), newest first.
+
+    Used only as a fallback when the assistant didn't explicitly ``deliver``
+    anything — so the user still gets the final APK without the old spam of
+    every changed image/class file.
+    """
     new: list[Path] = []
     for p, mtime in post.items():
         if p in pre and pre[p] >= mtime:
             continue
-        # Skip uploads/* — that's where user uploads land; we don't want to
-        # echo them back.
+        # Skip uploads/* — that's where the user's own uploads land.
         try:
-            rel = p.relative_to(p.anchor)
-            if "uploads" in rel.parts:
+            if "uploads" in p.relative_to(p.anchor).parts:
                 continue
         except ValueError:
             pass
         if p.name.startswith("."):
             continue
-        if p.suffix.lower() not in _UPLOADABLE_EXTS:
+        if p.suffix.lower() not in _FINAL_ARTIFACT_EXTS:
             continue
         try:
             size = p.stat().st_size
         except OSError:
             continue
-        if size == 0 or size > 45 * 1024 * 1024:  # Telegram outbound limit ~50 MB
+        if size == 0 or size > 45 * 1024 * 1024:
             continue
         new.append(p)
-    # Newest first.
     new.sort(key=lambda x: post.get(x, 0.0), reverse=True)
     return new
 
