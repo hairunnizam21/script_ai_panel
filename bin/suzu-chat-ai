@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Suzu Chat AI launcher.
+#
+# Loads the env file so AI_API_KEY / AI_API_BASE_URL / AI_DEFAULT_MODEL are
+# available, then execs the Python agent.  Designed to be symlinked into
+# /usr/local/bin/ by install.sh.
+
+set -u
+
+# Resolve the directory this script lives in (follow symlinks).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+PANEL_DIR="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+
+# Where the Suzu env file lives.  Overridable via $SUZU_ENV_FILE.
+ENV_FILE="${SUZU_ENV_FILE:-/var/www/suzu-ai-web/.env}"
+if [ ! -f "$ENV_FILE" ]; then
+  # Fallback: env file colocated with this script (dev checkout).
+  if [ -f "$PANEL_DIR/.env" ]; then
+    ENV_FILE="$PANEL_DIR/.env"
+  fi
+fi
+if [ -f "$ENV_FILE" ]; then
+  # Load AI_* and SUZU_* keys without exporting unrelated junk.
+  while IFS= read -r line; do
+    case "$line" in
+      AI_*|SUZU_*)
+        key="${line%%=*}"
+        value="${line#*=}"
+        # Strip surrounding quotes
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+        export "$key=$value"
+        ;;
+    esac
+  done < "$ENV_FILE"
+fi
+export SUZU_ENV_FILE="$ENV_FILE"
+
+# Allow running from a non-installed checkout (PANEL_DIR contains chat_ai/).
+if [ -d "$PANEL_DIR/chat_ai" ]; then
+  export PYTHONPATH="$PANEL_DIR${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
+PY="${SUZU_PYTHON:-python3}"
+if ! command -v "$PY" >/dev/null 2>&1; then
+  echo "error: python3 not found on PATH" >&2
+  exit 2
+fi
+
+exec "$PY" -m chat_ai "$@"
