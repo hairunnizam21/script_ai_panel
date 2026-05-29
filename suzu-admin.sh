@@ -518,61 +518,194 @@ action_chat_ai() {
   fi
 }
 
+_bot_users_json() {
+  printf '%s\n' "${SUZU_STATE_DIR:-/var/lib/suzu-ai}/telegram/users.json"
+}
+
+_bot_users_py() {
+  # Stream the users.json through a Python helper.  Arg 1 is the action;
+  # any additional args are passed positionally (e.g. user id).
+  local path
+  path="$(_bot_users_json)"
+  python3 - "$path" "$@" <<'PY'
+import json, sys, time, os
+path = sys.argv[1]
+action = sys.argv[2] if len(sys.argv) > 2 else "list"
+def load():
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"approved": {}, "banned": {}, "pending": {}, "admins": []}
+def save(d):
+    d["saved_at"] = time.time()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, path)
+def label(info):
+    name = (info.get("first_name", "") + " " + info.get("last_name", "")).strip()
+    uname = info.get("username", "")
+    return f"@{uname} ({name})" if uname else name or "(no name)"
+d = load()
+if action == "list":
+    admins = set(map(str, d.get("admins", [])))
+    print("== Approved (%d) ==" % len(d.get("approved", {})))
+    for uid, info in sorted(d.get("approved", {}).items(), key=lambda kv: int(kv[0])):
+        admin = " [admin]" if uid in admins else ""
+        print(f"  {uid}  {label(info)}{admin}")
+    print("\n== Banned (%d) ==" % len(d.get("banned", {})))
+    for uid, info in d.get("banned", {}).items():
+        print(f"  {uid}  {label(info)}  reason: {info.get('reason','')}")
+    print("\n== Pending (%d) ==" % len(d.get("pending", {})))
+    for uid, info in sorted(d.get("pending", {}).items(), key=lambda kv: -kv[1].get("last_seen", 0)):
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(info.get("last_seen", 0)))
+        print(f"  {uid}  {label(info)}  attempts={info.get('attempts',0)} last={when}")
+elif action == "approve":
+    uid = sys.argv[3]; src = d.get("pending", {}).get(uid, {})
+    entry = {"added_at": time.time(), "added_by": "suzu-admin"}
+    for k in ("username", "first_name", "last_name"):
+        if src.get(k): entry[k] = src[k]
+    d.setdefault("approved", {})[uid] = entry
+    d.get("pending", {}).pop(uid, None)
+    d.get("banned", {}).pop(uid, None)
+    save(d); print(f"approved {uid}")
+elif action == "ban":
+    uid = sys.argv[3]; reason = sys.argv[4] if len(sys.argv) > 4 else ""
+    entry = {"banned_at": time.time(), "banned_by": "suzu-admin", "reason": reason}
+    src = d.get("approved", {}).get(uid) or d.get("pending", {}).get(uid) or {}
+    for k in ("username", "first_name", "last_name"):
+        if src.get(k): entry[k] = src[k]
+    d.setdefault("banned", {})[uid] = entry
+    d.get("approved", {}).pop(uid, None)
+    d.get("pending", {}).pop(uid, None)
+    admins = [a for a in d.get("admins", []) if str(a) != uid]
+    d["admins"] = admins
+    save(d); print(f"banned {uid}")
+elif action == "unban":
+    uid = sys.argv[3]
+    if uid in d.get("banned", {}):
+        del d["banned"][uid]; save(d); print(f"unbanned {uid}")
+    else:
+        print(f"{uid} not in ban list")
+elif action == "promote":
+    uid = sys.argv[3]
+    if uid not in d.get("approved", {}):
+        d.setdefault("approved", {})[uid] = {"added_at": time.time(), "added_by": "promote"}
+    admins = list(map(str, d.get("admins", [])))
+    if uid not in admins:
+        admins.append(uid)
+    d["admins"] = admins
+    save(d); print(f"promoted {uid}")
+elif action == "demote":
+    uid = sys.argv[3]
+    admins = [a for a in map(str, d.get("admins", [])) if a != uid]
+    d["admins"] = admins
+    save(d); print(f"demoted {uid}")
+elif action == "count":
+    print(len(d.get("approved", {})), len(d.get("banned", {})), len(d.get("pending", {})), len(d.get("admins", [])))
+PY
+}
+
 action_telegram_bot() {
-  c_bld "=== Suzu Telegram Bot ==="
-  local token_set ids_set
-  token_set="$(env_get TELEGRAM_BOT_TOKEN)"
-  ids_set="$(env_get TELEGRAM_ALLOWED_USER_IDS)"
-  local status
-  if systemctl is-active --quiet suzu-telegram-bot.service 2>/dev/null; then
-    status="$(printf '\033[32mrunning\033[0m')"
-  elif systemctl list-unit-files --type=service 2>/dev/null | grep -q '^suzu-telegram-bot\.service'; then
-    status="$(printf '\033[33minactive\033[0m')"
-  else
-    status="$(printf '\033[31mnot installed\033[0m')"
-  fi
-  printf "  Status     : %b\n" "$status"
-  printf "  Bot        : @%s\n" "$(env_get TELEGRAM_BOT_USERNAME)"
-  printf "  Token      : %s\n" "$([ -n "$token_set" ] && echo '<set>' || echo '<empty>')"
-  printf "  Allowed IDs: %s\n" "${ids_set:-<empty>}"
-  echo
-  echo "  1) Set TELEGRAM_BOT_TOKEN"
-  echo "  2) Set TELEGRAM_ALLOWED_USER_IDS (comma-separated)"
-  echo "  3) Set TELEGRAM_BOT_USERNAME"
-  echo "  4) Restart bot service"
-  echo "  5) Stop bot service"
-  echo "  6) Tail bot logs (journalctl -f)"
-  echo "  7) View bot status (systemctl status)"
-  echo "  0) Back"
-  read -rp "Choice: " tc
-  case "$tc" in
-    1)
-       read -rp "New TELEGRAM_BOT_TOKEN: " nt
-       [ -z "$nt" ] && return
-       env_set TELEGRAM_BOT_TOKEN "$nt"
-       c_grn "Token saved."
-       systemctl restart suzu-telegram-bot.service 2>/dev/null || true
-       ;;
-    2)
-       read -rp "New TELEGRAM_ALLOWED_USER_IDS (csv): " ni
-       [ -z "$ni" ] && return
-       env_set TELEGRAM_ALLOWED_USER_IDS "$ni"
-       c_grn "Allowed user ids saved."
-       systemctl restart suzu-telegram-bot.service 2>/dev/null || true
-       ;;
-    3)
-       read -rp "New TELEGRAM_BOT_USERNAME: " nu
-       [ -z "$nu" ] && return
-       env_set TELEGRAM_BOT_USERNAME "${nu#@}"
-       c_grn "Bot username saved."
-       ;;
-    4) systemctl restart suzu-telegram-bot.service && c_grn "Restarted." || c_red "Restart failed." ;;
-    5) systemctl stop suzu-telegram-bot.service && c_grn "Stopped." || c_red "Stop failed." ;;
-    6) journalctl -u suzu-telegram-bot.service -f --no-pager ;;
-    7) systemctl status suzu-telegram-bot.service --no-pager -l | head -30 ;;
-    *) return ;;
-  esac
-  press_enter
+  while :; do
+    clear
+    c_bld "=== Suzu Telegram Bot ==="
+    local token_set ids_set status counts
+    token_set="$(env_get TELEGRAM_BOT_TOKEN)"
+    ids_set="$(env_get TELEGRAM_ALLOWED_USER_IDS)"
+    if systemctl is-active --quiet suzu-telegram-bot.service 2>/dev/null; then
+      status="$(printf '\033[32mrunning\033[0m')"
+    elif systemctl list-unit-files --type=service 2>/dev/null | grep -q '^suzu-telegram-bot\.service'; then
+      status="$(printf '\033[33minactive\033[0m')"
+    else
+      status="$(printf '\033[31mnot installed\033[0m')"
+    fi
+    counts="$(_bot_users_py count 2>/dev/null || echo '0 0 0 0')"
+    set -- $counts
+    printf "  Status     : %b\n" "$status"
+    printf "  Bot        : @%s\n" "$(env_get TELEGRAM_BOT_USERNAME)"
+    printf "  Token      : %s\n" "$([ -n "$token_set" ] && echo '<set>' || echo '<empty>')"
+    printf "  Users file : %s\n" "$(_bot_users_json)"
+    printf "  Users      : approved=%s banned=%s pending=%s admins=%s\n" "${1:-0}" "${2:-0}" "${3:-0}" "${4:-0}"
+    echo
+    c_bld "  Users:"
+    echo "   1) List users (approved/banned/pending)"
+    echo "   2) Approve user (enter id)"
+    echo "   3) Ban user (enter id [reason])"
+    echo "   4) Unban user"
+    echo "   5) Promote user to admin"
+    echo "   6) Demote admin"
+    c_bld "  Service:"
+    echo "   7) Restart bot"
+    echo "   8) Stop bot"
+    echo "   9) Start bot"
+    echo "  10) Tail logs (journalctl -f)"
+    echo "  11) View systemctl status"
+    c_bld "  Settings:"
+    echo "  12) Set TELEGRAM_BOT_TOKEN"
+    echo "  13) Set TELEGRAM_ALLOWED_USER_IDS (env seed only)"
+    echo "  14) Set TELEGRAM_BOT_USERNAME"
+    echo
+    echo "   0) Back"
+    read -rp "Choice: " tc
+    case "$tc" in
+      1) _bot_users_py list | less -R ;;
+      2)
+        read -rp "User id to approve: " uid
+        [ -z "$uid" ] && continue
+        _bot_users_py approve "$uid"
+        press_enter ;;
+      3)
+        read -rp "User id to ban: " uid
+        [ -z "$uid" ] && continue
+        read -rp "Reason (optional): " reason
+        _bot_users_py ban "$uid" "$reason"
+        press_enter ;;
+      4)
+        read -rp "User id to unban: " uid
+        [ -z "$uid" ] && continue
+        _bot_users_py unban "$uid"
+        press_enter ;;
+      5)
+        read -rp "User id to promote (admin): " uid
+        [ -z "$uid" ] && continue
+        _bot_users_py promote "$uid"
+        press_enter ;;
+      6)
+        read -rp "User id to demote: " uid
+        [ -z "$uid" ] && continue
+        _bot_users_py demote "$uid"
+        press_enter ;;
+      7) systemctl restart suzu-telegram-bot.service && c_grn "Restarted." || c_red "Restart failed."; press_enter ;;
+      8) systemctl stop    suzu-telegram-bot.service && c_grn "Stopped."   || c_red "Stop failed.";    press_enter ;;
+      9) systemctl start   suzu-telegram-bot.service && c_grn "Started."   || c_red "Start failed.";   press_enter ;;
+      10) journalctl -u suzu-telegram-bot.service -f --no-pager ;;
+      11) systemctl status suzu-telegram-bot.service --no-pager -l | head -40; press_enter ;;
+      12)
+        read -rp "New TELEGRAM_BOT_TOKEN: " nt
+        [ -z "$nt" ] && continue
+        env_set TELEGRAM_BOT_TOKEN "$nt"
+        systemctl restart suzu-telegram-bot.service 2>/dev/null || true
+        c_grn "Token saved & service restarted."
+        press_enter ;;
+      13)
+        read -rp "New TELEGRAM_ALLOWED_USER_IDS (csv, seed only): " ni
+        [ -z "$ni" ] && continue
+        env_set TELEGRAM_ALLOWED_USER_IDS "$ni"
+        c_grn "Saved.  (note: live allowlist lives in users.json \u2014 use option 2 to approve)"
+        press_enter ;;
+      14)
+        read -rp "New TELEGRAM_BOT_USERNAME: " nu
+        [ -z "$nu" ] && continue
+        env_set TELEGRAM_BOT_USERNAME "${nu#@}"
+        c_grn "Bot username saved."
+        press_enter ;;
+      0|q|Q) return ;;
+      *) c_red "Invalid choice."; sleep 0.5 ;;
+    esac
+  done
 }
 
 action_admin_token() {

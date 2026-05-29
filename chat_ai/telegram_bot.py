@@ -54,7 +54,7 @@ from .api import APIError, ChatClient
 from .config import Config
 from .prompts import render_system_prompt
 from .runner import run_turn, summarize_tool_output
-from .state import Session, list_sessions, latest_session_id
+from .state import Session, list_sessions
 from .tools import ToolContext, build_default_registry
 
 log = logging.getLogger("suzu.telegram")
@@ -154,7 +154,7 @@ class TelegramAPI:
             {
                 "offset": offset,
                 "timeout": timeout,
-                "allowed_updates": ["message", "edited_message"],
+                "allowed_updates": ["message", "edited_message", "callback_query"],
             },
             timeout=timeout + 10,
         )
@@ -167,6 +167,7 @@ class TelegramAPI:
         reply_to: Optional[int] = None,
         parse_mode: Optional[str] = None,
         disable_preview: bool = True,
+        reply_markup: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "chat_id": chat_id,
@@ -177,6 +178,8 @@ class TelegramAPI:
             params["reply_to_message_id"] = reply_to
         if parse_mode:
             params["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
         return self.call("sendMessage", params)
 
     def edit_message_text(
@@ -186,6 +189,7 @@ class TelegramAPI:
         text: str,
         *,
         parse_mode: Optional[str] = None,
+        reply_markup: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         params: dict[str, Any] = {
             "chat_id": chat_id,
@@ -195,6 +199,8 @@ class TelegramAPI:
         }
         if parse_mode:
             params["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
         try:
             return self.call("editMessageText", params)
         except TelegramError as e:
@@ -202,6 +208,23 @@ class TelegramAPI:
             if "message is not modified" in str(e).lower():
                 return None
             raise
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: Optional[str] = None,
+        show_alert: bool = False,
+    ) -> None:
+        params: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            params["text"] = text[:200]
+        if show_alert:
+            params["show_alert"] = True
+        try:
+            self.call("answerCallbackQuery", params)
+        except TelegramError as e:
+            log.debug("answerCallbackQuery failed: %s", e)
 
     def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         try:
@@ -342,6 +365,243 @@ class ChatBinding:
 
 
 # --------------------------------------------------------------------------- #
+# User store (approved / banned / pending / admins) backed by users.json
+# --------------------------------------------------------------------------- #
+
+
+class UserStore:
+    """Live allow/ban/admin list for the bot.
+
+    Persists to ``<state_dir>/telegram/users.json``.  Mutated at runtime by
+    the admin commands (``/approve``, ``/ban``, ...) and by the suzu-admin
+    TUI on the same host \u2014 a write picks up immediately on the next message
+    because we re-read the file at decision time when the on-disk mtime
+    changes.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.RLock()
+        self.approved: dict[str, dict[str, Any]] = {}
+        self.banned: dict[str, dict[str, Any]] = {}
+        self.pending: dict[str, dict[str, Any]] = {}
+        self.admins: set[str] = set()
+        self._mtime: float = 0.0
+        self._load()
+
+    @classmethod
+    def initialize(
+        cls,
+        path: Path,
+        *,
+        seed_allowed: Iterable[int] = (),
+        seed_admins: Iterable[int] = (),
+    ) -> "UserStore":
+        store = cls(path)
+        seed_allowed = list(seed_allowed)
+        seed_admins = list(seed_admins)
+        with store._lock:
+            now = time.time()
+            changed = False
+            # Seed approved on first ever start, but also top-up if a new id
+            # appears in the env var (so the env stays a useful "always-trust"
+            # fallback).
+            for uid in seed_allowed:
+                key = str(uid)
+                if key not in store.approved and key not in store.banned:
+                    store.approved[key] = {"added_at": now, "added_by": "env"}
+                    changed = True
+            if not store.admins:
+                # First boot \u2014 promote the env-listed admins (or fall back to
+                # all approved users if no explicit admin list was given).
+                pick = [str(uid) for uid in (seed_admins or seed_allowed)]
+                if pick:
+                    store.admins = set(pick)
+                    changed = True
+            if changed:
+                store._save_locked()
+        return store
+
+    # -- io ---------------------------------------------------------------- #
+
+    def _load(self) -> None:
+        with self._lock:
+            if not self.path.exists():
+                return
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                self._mtime = self.path.stat().st_mtime
+            except (OSError, json.JSONDecodeError):
+                return
+            self.approved = dict(raw.get("approved", {}))
+            self.banned = dict(raw.get("banned", {}))
+            self.pending = dict(raw.get("pending", {}))
+            self.admins = set(map(str, raw.get("admins", [])))
+
+    def _save_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        payload = {
+            "approved": self.approved,
+            "banned": self.banned,
+            "pending": self.pending,
+            "admins": sorted(self.admins, key=lambda x: int(x) if x.isdigit() else 0),
+            "saved_at": time.time(),
+        }
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+        try:
+            self._mtime = self.path.stat().st_mtime
+        except OSError:
+            pass
+
+    def _refresh_if_changed(self) -> None:
+        """Re-read users.json if it was modified by suzu-admin TUI."""
+        with self._lock:
+            try:
+                mtime = self.path.stat().st_mtime
+            except OSError:
+                return
+            if mtime > self._mtime:
+                self._load()
+
+    # -- queries ----------------------------------------------------------- #
+
+    def is_approved(self, uid: int) -> bool:
+        with self._lock:
+            self._refresh_if_changed()
+            key = str(uid)
+            return key in self.approved and key not in self.banned
+
+    def is_admin(self, uid: int) -> bool:
+        with self._lock:
+            self._refresh_if_changed()
+            return str(uid) in self.admins
+
+    def get_approved(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._refresh_if_changed()
+            return [
+                {"id": int(k), **v, "is_admin": k in self.admins}
+                for k, v in sorted(self.approved.items(), key=lambda kv: int(kv[0]))
+            ]
+
+    def get_banned(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._refresh_if_changed()
+            return [{"id": int(k), **v} for k, v in self.banned.items()]
+
+    def get_pending(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._refresh_if_changed()
+            return [
+                {"id": int(k), **v}
+                for k, v in sorted(
+                    self.pending.items(),
+                    key=lambda kv: kv[1].get("last_seen", 0),
+                    reverse=True,
+                )
+            ]
+
+    # -- mutations --------------------------------------------------------- #
+
+    def approve(self, uid: int, *, by_uid: int, meta: Optional[dict[str, Any]] = None) -> bool:
+        key = str(uid)
+        with self._lock:
+            self._refresh_if_changed()
+            if key in self.approved:
+                return False
+            entry: dict[str, Any] = {
+                "added_at": time.time(),
+                "added_by": str(by_uid),
+            }
+            # Carry over any metadata we observed while the user was pending
+            # so the admin sees @username, first_name etc.
+            for src in (self.pending.get(key), meta):
+                if src:
+                    for k in ("username", "first_name", "last_name"):
+                        if src.get(k):
+                            entry[k] = src[k]
+            self.approved[key] = entry
+            self.pending.pop(key, None)
+            self.banned.pop(key, None)
+            self._save_locked()
+            return True
+
+    def ban(self, uid: int, *, by_uid: int, reason: str = "") -> bool:
+        key = str(uid)
+        with self._lock:
+            self._refresh_if_changed()
+            entry: dict[str, Any] = {
+                "banned_at": time.time(),
+                "banned_by": str(by_uid),
+                "reason": reason,
+            }
+            # Preserve display name if we had one.
+            src = self.approved.get(key) or self.pending.get(key) or {}
+            for k in ("username", "first_name", "last_name"):
+                if src.get(k):
+                    entry[k] = src[k]
+            self.banned[key] = entry
+            self.approved.pop(key, None)
+            self.pending.pop(key, None)
+            self.admins.discard(key)
+            self._save_locked()
+            return True
+
+    def unban(self, uid: int) -> bool:
+        key = str(uid)
+        with self._lock:
+            self._refresh_if_changed()
+            if key not in self.banned:
+                return False
+            del self.banned[key]
+            self._save_locked()
+            return True
+
+    def add_admin(self, uid: int) -> bool:
+        key = str(uid)
+        with self._lock:
+            self._refresh_if_changed()
+            if key not in self.approved:
+                # Promote to approved first so admins are always approved.
+                self.approved[key] = {"added_at": time.time(), "added_by": "promote"}
+            if key in self.admins:
+                return False
+            self.admins.add(key)
+            self._save_locked()
+            return True
+
+    def remove_admin(self, uid: int) -> bool:
+        key = str(uid)
+        with self._lock:
+            self._refresh_if_changed()
+            if key not in self.admins:
+                return False
+            self.admins.discard(key)
+            self._save_locked()
+            return True
+
+    def record_attempt(self, uid: int, *, meta: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Log a rejected attempt so admins can review and approve later."""
+        key = str(uid)
+        with self._lock:
+            self._refresh_if_changed()
+            entry = self.pending.get(key, {})
+            now = time.time()
+            entry["first_seen"] = entry.get("first_seen", now)
+            entry["last_seen"] = now
+            entry["attempts"] = int(entry.get("attempts", 0)) + 1
+            if meta:
+                for k in ("username", "first_name", "last_name", "language_code"):
+                    if meta.get(k):
+                        entry[k] = meta[k]
+            self.pending[key] = entry
+            self._save_locked()
+            return entry
+
+
+# --------------------------------------------------------------------------- #
 # Typing indicator helper
 # --------------------------------------------------------------------------- #
 
@@ -382,6 +642,7 @@ class TypingPing:
 class BotConfig:
     bot_token: str
     allowed_user_ids: set[int]
+    admin_user_ids: set[int]
     bot_username: str = ""
 
     @classmethod
@@ -392,24 +653,32 @@ class BotConfig:
                 "TELEGRAM_BOT_TOKEN is empty — set it in /etc/suzu-panel/.env (or the "
                 "session env file) and restart the bot."
             )
-        raw_ids = os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "").strip()
-        ids: set[int] = set()
-        for tok in raw_ids.replace(";", ",").split(","):
-            tok = tok.strip()
-            if not tok:
-                continue
-            try:
-                ids.add(int(tok))
-            except ValueError:
-                log.warning("ignoring non-numeric allowed user id: %r", tok)
-        if not ids:
-            raise TelegramError(
-                "TELEGRAM_ALLOWED_USER_IDS is empty — the bot would be open to "
-                "the world.  Set it to a comma-separated list of Telegram user "
-                "ids (e.g. '12345,67890') and restart."
-            )
+        allowed = _parse_id_list(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", ""))
+        admins = _parse_id_list(os.environ.get("TELEGRAM_ADMIN_USER_IDS", ""))
+        # Live allowlist is stored in users.json; the env var is only used as
+        # a seed on first boot (and as a top-up if a new id appears).  An
+        # empty env var on subsequent boots is fine — the on-disk allowlist
+        # is the source of truth.
         username = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@")
-        return cls(bot_token=token, allowed_user_ids=ids, bot_username=username)
+        return cls(
+            bot_token=token,
+            allowed_user_ids=allowed,
+            admin_user_ids=admins,
+            bot_username=username,
+        )
+
+
+def _parse_id_list(raw: str) -> set[int]:
+    out: set[int] = set()
+    for tok in (raw or "").replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(int(tok))
+        except ValueError:
+            log.warning("ignoring non-numeric Telegram id: %r", tok)
+    return out
 
 
 class Bot:
@@ -419,13 +688,21 @@ class Bot:
         self.api = TelegramAPI(bot_cfg.bot_token)
         self.registry = build_default_registry()
         self.binding = ChatBinding.load(cfg.state_dir, cfg.sessions_dir, cfg.workspaces_dir)
+        self.users = UserStore.initialize(
+            cfg.state_dir / "telegram" / "users.json",
+            seed_allowed=bot_cfg.allowed_user_ids,
+            seed_admins=bot_cfg.admin_user_ids,
+        )
         self.client = ChatClient(cfg.api_base_url, cfg.api_key, timeout=cfg.request_timeout)
         me = self.api.get_me()
+        approved_now = [u["id"] for u in self.users.get_approved()]
+        admins_now = sorted(int(a) for a in self.users.admins)
         log.info(
-            "Suzu Telegram bot ready: @%s (id=%s) allowed=%s",
+            "Suzu Telegram bot ready: @%s (id=%s) approved=%s admins=%s",
             me.get("username"),
             me.get("id"),
-            sorted(bot_cfg.allowed_user_ids),
+            approved_now,
+            admins_now,
         )
         if not bot_cfg.bot_username and me.get("username"):
             self.bot_cfg.bot_username = me["username"]
@@ -454,27 +731,75 @@ class Bot:
     # -- dispatch ----------------------------------------------------------- #
 
     def _dispatch(self, update: dict[str, Any]) -> None:
+        if "callback_query" in update:
+            self._dispatch_callback(update["callback_query"])
+            return
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             return
         sender = msg.get("from") or {}
         uid = sender.get("id")
-        if not self._is_allowed(uid):
-            log.info("rejecting message from user %s (%s)", uid, sender.get("username"))
+        if uid is None:
+            return
+        if not self.users.is_approved(uid):
+            # Track the attempt so an admin can review/approve them later.
+            entry = self.users.record_attempt(
+                uid,
+                meta={
+                    "username": sender.get("username", ""),
+                    "first_name": sender.get("first_name", ""),
+                    "last_name": sender.get("last_name", ""),
+                    "language_code": sender.get("language_code", ""),
+                },
+            )
+            log.info(
+                "reject from user %s (@%s) — attempts=%s",
+                uid,
+                sender.get("username", ""),
+                entry.get("attempts"),
+            )
             try:
                 self.api.send_message(
                     msg["chat"]["id"],
-                    "Maaf, awak tidak dibenarkan menggunakan bot ini. "
-                    f"Telegram id awak: {uid}.\n\nKalau awak rasa ini patut "
-                    "dibenarkan, hubungi pentadbir bot.",
+                    "Maaf, awak tidak dibenarkan menggunakan bot ini.\n\n"
+                    f"Telegram id awak: `{uid}`.\n"
+                    "Pentadbir bot perlu approve dulu.",
+                    parse_mode="Markdown",
                 )
             except TelegramError as e:
                 log.debug("reject reply failed: %s", e)
+            # Notify admins so they can act quickly.
+            self._notify_admins_pending(uid, sender, entry)
             return
         self._handle_message(msg)
 
-    def _is_allowed(self, uid: Optional[int]) -> bool:
-        return uid is not None and uid in self.bot_cfg.allowed_user_ids
+    def _notify_admins_pending(
+        self, uid: int, sender: dict[str, Any], entry: dict[str, Any]
+    ) -> None:
+        """Ping every admin that someone tried to use the bot, with inline
+        Approve/Ban buttons so they can act in one tap."""
+        # Only ping once when the user first appears — not on every attempt.
+        if int(entry.get("attempts", 1)) != 1:
+            return
+        label = self._user_label(sender)
+        body = (
+            f"🔔 Pending user: {label}\n"
+            f"Telegram id: `{uid}`\n"
+            "Use the buttons below to approve or ban."
+        )
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve", "callback_data": f"approve:{uid}"},
+                    {"text": "🚫 Ban", "callback_data": f"ban:{uid}"},
+                ]
+            ]
+        }
+        for admin_id in sorted(int(a) for a in self.users.admins):
+            try:
+                self.api.send_message(admin_id, body, parse_mode="Markdown", reply_markup=kb)
+            except TelegramError as e:
+                log.debug("could not notify admin %s: %s", admin_id, e)
 
     # -- message types ------------------------------------------------------ #
 
@@ -525,15 +850,17 @@ class Bot:
 
     def _handle_command(self, msg: dict[str, Any], text: str) -> bool:
         chat_id = msg["chat"]["id"]
+        sender = msg.get("from") or {}
         head, _, rest = text.partition(" ")
         head = head.split("@", 1)[0].lower()  # strip "@botname"
         rest = rest.strip()
+        is_admin = self.users.is_admin(int(sender.get("id") or 0))
 
         if head == "/start":
-            self._cmd_start(chat_id)
+            self._cmd_start(chat_id, is_admin=is_admin)
             return True
         if head == "/help":
-            self._cmd_help(chat_id)
+            self._cmd_help(chat_id, is_admin=is_admin)
             return True
         if head == "/status":
             self._cmd_status(chat_id)
@@ -554,18 +881,52 @@ class Bot:
             self._cmd_model(chat_id, rest)
             return True
         if head == "/whoami":
-            sender = msg.get("from") or {}
+            uid = sender.get("id")
             self.api.send_message(
                 chat_id,
-                f"id: `{sender.get('id')}`\nusername: @{sender.get('username','')}\n"
-                f"name: {sender.get('first_name','')} {sender.get('last_name','')}".strip(),
+                f"id: `{uid}`\nusername: @{sender.get('username','')}\n"
+                f"name: {sender.get('first_name','')} {sender.get('last_name','')}\n"
+                f"role: {'admin' if is_admin else 'user'}".strip(),
                 parse_mode="Markdown",
             )
             return True
+
+        # ------------------------------------------------------------------
+        # Admin-only commands. We always handle the dispatch (return True) so
+        # the message doesn't accidentally get forwarded to the model, but we
+        # tell unauthorised callers they can't run it.
+        # ------------------------------------------------------------------
+        if head in ("/users", "/pending", "/approve", "/ban", "/unban",
+                    "/admins", "/promote", "/demote"):
+            if not is_admin:
+                self.api.send_message(
+                    chat_id,
+                    "Maaf, command ini untuk admin sahaja.",
+                )
+                return True
+            uid_admin = int(sender["id"])
+            if head == "/users":
+                self._cmd_admin_users(chat_id)
+            elif head == "/pending":
+                self._cmd_admin_pending(chat_id)
+            elif head == "/approve":
+                self._cmd_admin_approve(chat_id, rest, by_uid=uid_admin)
+            elif head == "/ban":
+                self._cmd_admin_ban(chat_id, rest, by_uid=uid_admin)
+            elif head == "/unban":
+                self._cmd_admin_unban(chat_id, rest)
+            elif head == "/admins":
+                self._cmd_admin_admins(chat_id)
+            elif head == "/promote":
+                self._cmd_admin_promote(chat_id, rest)
+            elif head == "/demote":
+                self._cmd_admin_demote(chat_id, rest, self_uid=uid_admin)
+            return True
+
         # Unknown slash command — let the model see it as plain text.
         return False
 
-    def _cmd_start(self, chat_id: int) -> None:
+    def _cmd_start(self, chat_id: int, *, is_admin: bool = False) -> None:
         uname = self.bot_cfg.bot_username or "bot"
         text = (
             f"👋 *Selamat datang ke Suzu Chat AI* (@{uname})\n\n"
@@ -583,10 +944,44 @@ class Bot:
             "  /clear — kosongkan history (kekal system prompt)\n"
             "  /whoami — Telegram id awak"
         )
-        self.api.send_message(chat_id, text, parse_mode="Markdown")
+        if is_admin:
+            text += (
+                "\n\n*Admin commands:*\n"
+                "  /users — list approved/banned/pending users\n"
+                "  /pending — review users yang nak akses (dgn butang approve/ban)\n"
+                "  /approve <id> — approve user\n"
+                "  /ban <id> [reason] — ban user\n"
+                "  /unban <id> — buka ban\n"
+                "  /admins — list admins\n"
+                "  /promote <id> — jadikan admin\n"
+                "  /demote <id> — turunkan dari admin"
+            )
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 Status", "callback_data": "menu:status"},
+                    {"text": "📁 Workspace", "callback_data": "menu:workspace"},
+                ],
+                [
+                    {"text": "💬 New session", "callback_data": "menu:new"},
+                    {"text": "📂 Sessions", "callback_data": "menu:sessions"},
+                ],
+                [
+                    {"text": "❓ Help", "callback_data": "menu:help"},
+                ],
+            ]
+        }
+        if is_admin:
+            kb["inline_keyboard"].append(
+                [
+                    {"text": "👥 Users", "callback_data": "menu:users"},
+                    {"text": "⏳ Pending", "callback_data": "menu:pending"},
+                ]
+            )
+        self.api.send_message(chat_id, text, parse_mode="Markdown", reply_markup=kb)
 
-    def _cmd_help(self, chat_id: int) -> None:
-        self._cmd_start(chat_id)
+    def _cmd_help(self, chat_id: int, *, is_admin: bool = False) -> None:
+        self._cmd_start(chat_id, is_admin=is_admin)
 
     def _cmd_status(self, chat_id: int) -> None:
         tools = [
@@ -660,6 +1055,227 @@ class Bot:
         session.model = rest.split()[0]
         session.save(self.cfg.sessions_dir)
         self.api.send_message(chat_id, f"✅ model: `{session.model}`", parse_mode="Markdown")
+
+    # -- admin commands ---------------------------------------------------- #
+
+    def _cmd_admin_users(self, chat_id: int) -> None:
+        approved = self.users.get_approved()
+        banned = self.users.get_banned()
+        pending = self.users.get_pending()
+        lines = [f"*\ud83d\udc65 Users* (approved={len(approved)} banned={len(banned)} pending={len(pending)})", ""]
+        if approved:
+            lines.append("*Approved:*")
+            for u in approved[:20]:
+                admin_mark = " \u2b50" if u.get("is_admin") else ""
+                label = self._user_label_from_info(u)
+                lines.append(f"  {label}{admin_mark}")
+        if banned:
+            lines.append("\n*Banned:*")
+            for u in banned[:10]:
+                label = self._user_label_from_info(u)
+                lines.append(f"  {label} \u2014 {u.get('reason', '')}")
+        if pending:
+            lines.append("\n*Pending (wants access):*")
+            for u in pending[:10]:
+                label = self._user_label_from_info(u)
+                lines.append(f"  {label} \u2014 attempts={u.get('attempts', 0)}")
+        self.api.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+
+    def _cmd_admin_pending(self, chat_id: int) -> None:
+        pending = self.users.get_pending()
+        if not pending:
+            self.api.send_message(chat_id, "\u2705 Tiada pending users.")
+            return
+        for u in pending[:10]:
+            label = self._user_label_from_info(u)
+            uid = u["id"]
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(u.get("last_seen", 0)))
+            body = (
+                f"\ud83d\udc64 *Pending user*\n"
+                f"  {label}\n"
+                f"  attempts: {u.get('attempts', 0)} | last: {when}\n"
+            )
+            kb = {
+                "inline_keyboard": [
+                    [
+                        {"text": "\u2705 Approve", "callback_data": f"approve:{uid}"},
+                        {"text": "\ud83d\udeab Ban", "callback_data": f"ban:{uid}"},
+                    ]
+                ]
+            }
+            self.api.send_message(chat_id, body, parse_mode="Markdown", reply_markup=kb)
+
+    def _cmd_admin_approve(self, chat_id: int, rest: str, *, by_uid: int) -> None:
+        uid = self._parse_uid_arg(rest)
+        if uid is None:
+            self.api.send_message(chat_id, "Usage: `/approve <user_id>`", parse_mode="Markdown")
+            return
+        ok = self.users.approve(uid, by_uid=by_uid)
+        if ok:
+            self.api.send_message(chat_id, f"\u2705 User `{uid}` approved.", parse_mode="Markdown")
+            try:
+                self.api.send_message(uid, "\ud83c\udf89 Awak telah diluluskan! Hantar `/start` untuk mula.")
+            except TelegramError:
+                pass
+        else:
+            self.api.send_message(chat_id, f"User `{uid}` sudah approved sebelum ini.", parse_mode="Markdown")
+
+    def _cmd_admin_ban(self, chat_id: int, rest: str, *, by_uid: int) -> None:
+        parts = rest.split(maxsplit=1)
+        uid = self._parse_uid_arg(parts[0] if parts else "")
+        reason = parts[1] if len(parts) > 1 else ""
+        if uid is None:
+            self.api.send_message(chat_id, "Usage: `/ban <user_id> [reason]`", parse_mode="Markdown")
+            return
+        self.users.ban(uid, by_uid=by_uid, reason=reason)
+        self.api.send_message(chat_id, f"\ud83d\udeab User `{uid}` banned. reason: {reason or '(none)'}", parse_mode="Markdown")
+
+    def _cmd_admin_unban(self, chat_id: int, rest: str) -> None:
+        uid = self._parse_uid_arg(rest)
+        if uid is None:
+            self.api.send_message(chat_id, "Usage: `/unban <user_id>`", parse_mode="Markdown")
+            return
+        ok = self.users.unban(uid)
+        if ok:
+            self.api.send_message(chat_id, f"\u2705 User `{uid}` unbanned.", parse_mode="Markdown")
+        else:
+            self.api.send_message(chat_id, f"User `{uid}` not in ban list.", parse_mode="Markdown")
+
+    def _cmd_admin_admins(self, chat_id: int) -> None:
+        admins = sorted(int(a) for a in self.users.admins)
+        if not admins:
+            self.api.send_message(chat_id, "Tiada admins (semua env users)")
+            return
+        lines = ["*Admins:*"]
+        for uid in admins:
+            info = self.users.approved.get(str(uid), {})
+            lines.append(f"  \u2b50 `{uid}` {info.get('username', '')} {info.get('first_name', '')}")
+        self.api.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+
+    def _cmd_admin_promote(self, chat_id: int, rest: str) -> None:
+        uid = self._parse_uid_arg(rest)
+        if uid is None:
+            self.api.send_message(chat_id, "Usage: `/promote <user_id>`", parse_mode="Markdown")
+            return
+        self.users.add_admin(uid)
+        self.api.send_message(chat_id, f"\u2b50 `{uid}` sekarang admin.", parse_mode="Markdown")
+
+    def _cmd_admin_demote(self, chat_id: int, rest: str, *, self_uid: int) -> None:
+        uid = self._parse_uid_arg(rest)
+        if uid is None:
+            self.api.send_message(chat_id, "Usage: `/demote <user_id>`", parse_mode="Markdown")
+            return
+        if uid == self_uid:
+            self.api.send_message(chat_id, "Awak tak boleh demote diri sendiri.")
+            return
+        ok = self.users.remove_admin(uid)
+        if ok:
+            self.api.send_message(chat_id, f"\u2705 `{uid}` bukan admin lagi.", parse_mode="Markdown")
+        else:
+            self.api.send_message(chat_id, f"`{uid}` bukan admin.", parse_mode="Markdown")
+
+    # -- callback queries (inline button presses) -------------------------- #
+
+    def _dispatch_callback(self, query: dict[str, Any]) -> None:
+        qid = query.get("id", "")
+        sender = query.get("from") or {}
+        uid = int(sender.get("id") or 0)
+        data = query.get("data") or ""
+        msg = query.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id") or uid
+        msg_id = msg.get("message_id")
+
+        # Menu shortcuts (available to all approved users).
+        if data.startswith("menu:"):
+            self.api.answer_callback_query(qid)
+            action = data.split(":", 1)[1]
+            is_admin = self.users.is_admin(uid)
+            if action == "status":
+                self._cmd_status(chat_id)
+            elif action == "workspace":
+                self._cmd_workspace(chat_id)
+            elif action == "new":
+                self._cmd_new(chat_id)
+            elif action == "sessions":
+                self._cmd_sessions(chat_id)
+            elif action == "help":
+                self._cmd_help(chat_id, is_admin=is_admin)
+            elif action == "users" and is_admin:
+                self._cmd_admin_users(chat_id)
+            elif action == "pending" and is_admin:
+                self._cmd_admin_pending(chat_id)
+            return
+
+        # Admin approve/ban actions.
+        if not self.users.is_admin(uid):
+            self.api.answer_callback_query(qid, text="Admin sahaja.", show_alert=True)
+            return
+
+        if data.startswith("approve:"):
+            target_uid = int(data.split(":", 1)[1])
+            ok = self.users.approve(target_uid, by_uid=uid)
+            if ok:
+                self.api.answer_callback_query(qid, text=f"\u2705 {target_uid} approved")
+                # Edit the original message to mark as handled.
+                if msg_id:
+                    self.api.edit_message_text(
+                        chat_id, msg_id,
+                        f"\u2705 *Approved* user `{target_uid}`",
+                        parse_mode="Markdown",
+                        reply_markup={"inline_keyboard": []},
+                    )
+                # Let the user know they got access.
+                try:
+                    self.api.send_message(
+                        target_uid,
+                        "\ud83c\udf89 Awak telah diluluskan! Hantar `/start` untuk mula.",
+                    )
+                except TelegramError:
+                    pass
+            else:
+                self.api.answer_callback_query(qid, text=f"{target_uid} already approved")
+            return
+
+        if data.startswith("ban:"):
+            target_uid = int(data.split(":", 1)[1])
+            self.users.ban(target_uid, by_uid=uid)
+            self.api.answer_callback_query(qid, text=f"\ud83d\udeab {target_uid} banned")
+            if msg_id:
+                self.api.edit_message_text(
+                    chat_id, msg_id,
+                    f"\ud83d\udeab *Banned* user `{target_uid}`",
+                    parse_mode="Markdown",
+                    reply_markup={"inline_keyboard": []},
+                )
+            return
+
+        self.api.answer_callback_query(qid, text="Unknown action")
+
+    # -- helpers ----------------------------------------------------------- #
+
+    @staticmethod
+    def _user_label(sender: dict[str, Any]) -> str:
+        uname = sender.get("username", "")
+        name = f"{sender.get('first_name', '')} {sender.get('last_name', '')}".strip()
+        uid = sender.get("id", "?")
+        return f"@{uname} ({name}, id={uid})" if uname else f"{name} (id={uid})"
+
+    @staticmethod
+    def _user_label_from_info(info: dict[str, Any]) -> str:
+        uid = info.get("id", "?")
+        uname = info.get("username", "")
+        name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip()
+        return f"`{uid}` @{uname} ({name})" if uname else f"`{uid}` {name}"
+
+    @staticmethod
+    def _parse_uid_arg(s: str) -> Optional[int]:
+        s = s.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
 
     # -- session helpers --------------------------------------------------- #
 
