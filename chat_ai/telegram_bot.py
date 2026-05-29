@@ -1062,7 +1062,7 @@ class Bot:
         if head == "/workspace":
             self._cmd_workspace(chat_id)
             return True
-        if head == "/clear":
+        if head in ("/clear", "/reset"):
             self._cmd_clear(chat_id)
             return True
         if head == "/model":
@@ -1126,10 +1126,12 @@ class Bot:
             "  /help — list semua command\n"
             "  /status — status tools di server\n"
             "  /new — start session baru (history kosong)\n"
+            "  /clear (atau /reset) — kosongkan history sesi semasa\n"
+            "     (guna kalau bot mula merepek atau ulang benda yang awak\n"
+            "      tak pernah cakap — history mungkin tercemar)\n"
             "  /sessions — list session\n"
             "  /workspace — print path workspace\n"
             "  /model NAME — tukar model\n"
-            "  /clear — kosongkan history (kekal system prompt)\n"
             "  /whoami — Telegram id awak"
         )
         if is_admin:
@@ -1233,7 +1235,12 @@ class Bot:
         sys_msgs = [m for m in session.messages if m.get("role") == "system"]
         session.messages = sys_msgs
         session.save(self.cfg.sessions_dir)
-        self.api.send_message(chat_id, "🧹 History dikosongkan.")
+        # Any queued uploads from the now-discarded turn no longer make sense.
+        self._pending_files.pop(chat_id, None)
+        self.api.send_message(
+            chat_id,
+            "🧹 History dikosongkan. Hantar task baru — fresh slate.",
+        )
 
     def _cmd_model(self, chat_id: int, rest: str) -> None:
         session = self.binding.session_for(chat_id, model=self.cfg.default_model)
